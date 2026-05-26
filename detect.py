@@ -279,6 +279,9 @@ def run(
 
                 # Write results
                 frame_status = "00" 
+                
+                # 🎨 為了畫半透明陰影，先複製一份跟 im0 一模一樣的畫布
+                overlay = im0.copy()
 
                 for *xyxy, conf, cls in reversed(det):
                     c = int(cls)  # integer class
@@ -291,74 +294,80 @@ def run(
 
                     if save_txt:  # Write to file
                         if save_format == 0:
-                            coords = (
-                                (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
-                            )  # normalized xywh
+                            coords = ((xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist())
                         else:
-                            coords = (torch.tensor(xyxy).view(1, 4) / gn).view(-1).tolist()  # xyxy
-                        line = (cls, *coords, conf) if save_conf else (cls, *coords)  # label format
+                            coords = (torch.tensor(xyxy).view(1, 4) / gn).view(-1).tolist()
+                        line = (cls, *coords, conf) if save_conf else (cls, *coords)
                         with open(f"{txt_path}.txt", "a") as f:
                             f.write(("%g " * len(line)).rstrip() % line + "\n")
 
                     if save_img or save_crop or view_img:  # Add bbox to image
-                        c = int(cls)  # integer class
+                        c = int(cls)
                         label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
                         annotator.box_label(xyxy, label, color=colors(c, True))
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
 
                     # =================================================================
-                    # 🚀 See Through 畢業製作：弱勢用路人 ADAS 分區狀態碼計算
+                    # 🚀 See Through 畢業製作：優化分區演算法 (高度調高、寬度變寬、防反光)
                     # =================================================================
-                    # 1. 取得當前物件中心點與底邊的正規化比例座標 (0.0 ~ 1.0)
                     xywh_ratio = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
                     x_center = xywh_ratio[0]   # 中心點 X 比例
                     y_center = xywh_ratio[1]   # 中心點 Y 比例
-                    y_bottom = y_center + (xywh_ratio[3] / 2)  # 底部 Y 比例 (接地點)
+                    y_bottom = y_center + (xywh_ratio[3] / 2)  # 底部 Y 比例
 
-                    # 2. 定義核心「弱勢用路人」清單
                     vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
 
-                    # 3. 只有偵測到弱勢用路人，且不在天空區域 (Y > 0.45) 時才進行分區判定
+                    # 💡 【過濾機制】：防引擎蓋/雨刷反光，物件踩得太死（太接近車頭）直接視為雜訊
+                    if y_bottom > 0.82 and label == 'car':
+                        continue
+
+                    # 只有偵測到弱勢用路人，且不在天空區域 (Y > 0.45) 時才進行防禦圍籬判定
                     if label in vulnerable_road_users and y_center > 0.45:
-                        # 【情況一：正前方核心車道危險區 -> 優先級最高，直接設為 10】
-                        if (0.35 <= x_center <= 0.65) and (0.60 <= y_bottom <= 0.85):
+                        
+                        # 🔥【優化後的中央危險區 C】：高度調高到 0.45，寬度加寬到 0.30~0.70
+                        if (0.30 <= x_center <= 0.70) and (0.45 <= y_bottom <= 0.82):
                             frame_status = "10"
-                        # 【情況二：左右兩側鄰近威脅區 -> 如果目前不是最危險的 10，就設為 01】
-                        elif (0.10 <= x_center < 0.35) and (0.50 <= y_bottom <= 0.85):
+                            
+                        # 🌲【優化後的左右側向威脅區】：同樣調高高度與防車頭干擾
+                        elif (0.05 <= x_center < 0.30) and (0.45 <= y_bottom <= 0.82):
                             if frame_status != "10":
                                 frame_status = "01"
-                        elif (0.65 < x_center <= 0.90) and (0.50 <= y_bottom <= 0.85):
+                        elif (0.70 < x_center <= 0.95) and (0.45 <= y_bottom <= 0.82):
                             if frame_status != "10":
                                 frame_status = "01"
 
                 # =================================================================
-                # 🎨 每一幀畫面結束後：噴出狀態碼 + 繪製實體電子圍籬格線 (在 for 迴圈外面)
+                # 🎨 HUD 級視覺化：半透明陰影區域標註 (在 for 迴圈外面)
                 # =================================================================
-                # A. 無延遲即時噴出這幀畫面最終的狀態碼，供 Jetson Nano 下位機與馬達同步
-                print(f"{frame_status}")
+                print(f"{frame_status}") # 噴出即時狀態碼
 
-                # B. 在輸出的影像上，繪製出紅色與橘色的實體 ROI 電子圍籬格線
                 h, w, _ = im0.shape
                 
-                # 繪製中央核心危險區 (10) -> 紅色方框 (線粗=3)
-                c_x1, c_y1 = int(0.35 * w), int(0.60 * h)
-                c_x2, c_y2 = int(0.65 * w), int(0.85 * h)
-                cv2.rectangle(im0, (c_x1, c_y1), (c_x2, c_y2), (0, 0, 255), 3)
-                cv2.putText(im0, f"DANGER ZONE ({frame_status})", (c_x1 + 10, c_y1 + 30), 
+                # A. 繪製中央核心危險區陰影 -> 填滿紅色 (0, 0, 255)，厚度改為 -1 代表填滿
+                c_x1, c_y1 = int(0.30 * w), int(0.45 * h)
+                c_x2, c_y2 = int(0.70 * w), int(0.82 * h)
+                cv2.rectangle(overlay, (c_x1, c_y1), (c_x2, c_y2), (0, 0, 255), -1)
+                
+                # B. 繪製左側威脅區陰影 -> 填滿橘色 (0, 120, 255)
+                l_x1, l_y1 = int(0.05 * w), int(0.45 * h)
+                l_x2, l_y2 = int(0.30 * w), int(0.82 * h)
+                cv2.rectangle(overlay, (l_x1, l_y1), (l_x2, l_y2), (0, 120, 255), -1)
+                
+                # C. 繪製右側威脅區陰影 -> 填滿橘色 (0, 120, 255)
+                r_x1, r_y1 = int(0.70 * w), int(0.45 * h)
+                r_x2, r_y2 = int(0.95 * w), int(0.82 * h)
+                cv2.rectangle(overlay, (r_x1, r_y1), (r_x2, r_y2), (0, 120, 255), -1)
+
+                # D. 💥 關鍵核心：將畫了實心色彩的 overlay 與原圖 im0 進行半透明融合
+                # alpha 為原圖權重，beta 為陰影圖權重 (0.15 代表 15% 的極淡透明度，完全不遮擋畫面)
+                alpha = 0.85
+                beta = 0.15
+                cv2.addWeighted(overlay, beta, im0, alpha, 0, im0)
+                
+                # E. 在半透明區上方壓上乾淨的科技感文字提示
+                cv2.putText(im0, f"ADAS: {frame_status}", (c_x1 + 10, c_y1 + 30), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                
-                # 繪製左側威脅區 (01) -> 橘色方框
-                l_x1, l_y1 = int(0.10 * w), int(0.50 * h)
-                l_x2, l_y2 = int(0.35 * w), int(0.85 * h)
-                cv2.rectangle(im0, (l_x1, l_y1), (l_x2, l_y2), (0, 165, 255), 2)
-                
-                # 繪製右側威脅區 (01) -> 橘色方框
-                r_x1, r_y1 = int(0.65 * w), int(0.50 * h)
-                r_x2, r_y2 = int(0.90 * w), int(0.85 * h)
-                cv2.rectangle(im0, (r_x1, r_y1), (r_x2, r_y2), (0, 165, 255), 2)
-                cv2.putText(im0, "SIDE WARNING (01)", (l_x1 + 10, l_y1 + 25), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
             # Stream results
             im0 = annotator.result()
