@@ -279,20 +279,31 @@ def run(
 
                 # Write results
                 frame_status = "00" 
-                
-                # 🎨 複製一份畫布用來製作科技感半透明陰影
                 overlay = im0.copy()
 
                 for *xyxy, conf, cls in reversed(det):
-                    c = int(cls)  # integer class
-                    label = names[c]
+                    c = int(cls)
+                    # 💡 【關鍵修復1】：抓取純淨的類別名稱 (如 'person')，絕對不加數字
+                    class_name = names[c] 
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
 
-                    if save_csv:
-                        write_to_csv(p.name, label, confidence_str)
+                    # 1. 預先計算座標，供過濾與 ROI 使用
+                    gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]
+                    xywh_ratio = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
+                    x_center = xywh_ratio[0]
+                    y_center = xywh_ratio[1]
 
-                    if save_txt:  # Write to file
+                    # 💡 【關鍵修復2】：將反光過濾器移到「畫框框之前」的最高優先級！
+                    # 只要是車子，且中心點落在畫面左下角(x < 0.30 且 y > 0.70)，直接放生！
+                    if class_name == 'car' and (x_center < 0.30 and y_center > 0.70):
+                        continue # 提早結束這回合，絕對不會存檔也不會畫框！
+
+                    # =================================================================
+                    # 原廠的存檔與畫框邏輯 (只會畫出通過上面過濾器的真實物件)
+                    if save_csv:
+                        write_to_csv(p.name, class_name, confidence_str)
+                    if save_txt:  
                         if save_format == 0:
                             coords = ((xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist())
                         else:
@@ -300,72 +311,47 @@ def run(
                         line = (cls, *coords, conf) if save_conf else (cls, *coords)
                         with open(f"{txt_path}.txt", "a") as f:
                             f.write(("%g " * len(line)).rstrip() % line + "\n")
-
-                    if save_img or save_crop or view_img:  # Add bbox to image
-                        c = int(cls)
-                        label = None if hide_labels else (names[c] if hide_conf else f"{names[c]} {conf:.2f}")
-                        annotator.box_label(xyxy, label, color=colors(c, True))
+                    if save_img or save_crop or view_img:  
+                        # 這裡組合出包含數字的字串用來顯示
+                        display_label = None if hide_labels else (class_name if hide_conf else f"{class_name} {conf:.2f}")
+                        annotator.box_label(xyxy, display_label, color=colors(c, True))
                     if save_crop:
-                        save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
-
+                        save_one_box(xyxy, imc, file=save_dir / "crops" / class_name / f"{p.stem}.jpg", BGR=True)
                     # =================================================================
-                    # 🚀 See Through 畢業製作：ROI 全面拉滿 + 中央再加寬 + 精準濾除左下角
-                    # =================================================================
-                    xywh_ratio = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
-                    x_center = xywh_ratio[0]   # 中心點 X 比例
-                    y_center = xywh_ratio[1]   # 中心點 Y 比例
-                    y_bottom = y_center + (xywh_ratio[3] / 2)  # 底部 Y 比例
 
+                    # 🚀 See Through 畢業製作：ROI 全拉滿狀態碼判定
                     vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
 
-                    # 💡 【精準過濾】：直接定點清除左下角擋風玻璃/引擎蓋的車子反射誤檢
-                    if label == 'car' and (x_center < 0.25 and y_center > 0.70):
-                        continue
-
-                    # 只有偵測到弱勢用路人時，才進行防禦圍籬判定 (移除高度與底部限制，全高度追蹤)
-                    if label in vulnerable_road_users:
-                        
-                        # 🔥【全面拉滿的中央危險區 C】：寬度拓寬到 0.25~0.75，高度拉滿到 0.0~1.0
-                        if (0.25 <= x_center <= 0.75) and (0.0 <= y_bottom <= 1.0):
+                    # 這裡使用純淨的 class_name 來比對，保證百發百中
+                    if class_name in vulnerable_road_users:
+                        # 中央危險區 C
+                        if (0.25 <= x_center <= 0.75):
                             frame_status = "10"
-                            
-                        # 🌲【全面拉滿的左右側向威脅區】
-                        elif (0.0 <= x_center < 0.25) and (0.0 <= y_bottom <= 1.0):
-                            if frame_status != "10":
-                                frame_status = "01"
-                        elif (0.75 < x_center <= 1.0) and (0.0 <= y_bottom <= 1.0):
-                            if frame_status != "10":
-                                frame_status = "01"
+                        # 左右側向威脅區
+                        elif (0.0 <= x_center < 0.25):
+                            if frame_status != "10": frame_status = "01"
+                        elif (0.75 < x_center <= 1.0):
+                            if frame_status != "10": frame_status = "01"
 
-                # =================================================================
-                # 🎨 HUD 級視覺化：半透明陰影區域標註 (全高度拉滿版)
-                # =================================================================
+                # 🎨 HUD 級視覺化：半透明陰影區域標註 (全高度拉滿)
                 print(f"{frame_status}") # 噴出即時狀態碼
 
                 h, w, _ = im0.shape
-                
-                # A. 中央核心危險區陰影 -> 填滿紅色 (Y 軸從 0 拉到 h)
-                c_x1, c_y1 = int(0.25 * w), int(0.0 * h)
-                c_x2, c_y2 = int(0.75 * w), int(1.0 * h)
+                c_x1, c_y1 = int(0.25 * w), 0
+                c_x2, c_y2 = int(0.75 * w), h
                 cv2.rectangle(overlay, (c_x1, c_y1), (c_x2, c_y2), (0, 0, 255), -1)
                 
-                # B. 左側威脅區陰影 -> 填滿橘色
-                l_x1, l_y1 = int(0.0 * w), int(0.0 * h)
-                l_x2, l_y2 = int(0.25 * w), int(1.0 * h)
+                l_x1, l_y1 = 0, 0
+                l_x2, l_y2 = int(0.25 * w), h
                 cv2.rectangle(overlay, (l_x1, l_y1), (l_x2, l_y2), (0, 120, 255), -1)
                 
-                # C. 右側威脅區陰影 -> 填滿橘色
-                r_x1, r_y1 = int(0.75 * w), int(0.0 * h)
-                r_x2, r_y2 = int(1.0 * w), int(1.0 * h)
+                r_x1, r_y1 = int(0.75 * w), 0
+                r_x2, r_y2 = int(1.0 * w), h
                 cv2.rectangle(overlay, (r_x1, r_y1), (r_x2, r_y2), (0, 120, 255), -1)
 
-                # D. 將實心色彩的 overlay 與原圖 im0 進行淡陰影半透明融合
-                # 透明度 beta 調低到 0.12，讓陰影更淡、更像導航 HUD，完全不擋夜間視線
-                alpha = 0.88
-                beta = 0.12
+                # 淡化陰影
+                alpha, beta = 0.88, 0.12
                 cv2.addWeighted(overlay, beta, im0, alpha, 0, im0)
-                
-                # E. 文字提示
                 cv2.putText(im0, f"ADAS: {frame_status}", (c_x1 + 10, int(0.1 * h)), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
  
