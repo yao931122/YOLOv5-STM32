@@ -278,6 +278,8 @@ def run(
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
                 # Write results
+                frame_status = "00" 
+
                 for *xyxy, conf, cls in reversed(det):
                     c = int(cls)  # integer class
                     label = names[c]
@@ -304,6 +306,59 @@ def run(
                         annotator.box_label(xyxy, label, color=colors(c, True))
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / "crops" / names[c] / f"{p.stem}.jpg", BGR=True)
+
+                    # =================================================================
+                    # 🚀 See Through 畢業製作：弱勢用路人 ADAS 分區狀態碼計算
+                    # =================================================================
+                    # 1. 取得當前物件中心點與底邊的正規化比例座標 (0.0 ~ 1.0)
+                    xywh_ratio = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
+                    x_center = xywh_ratio[0]   # 中心點 X 比例
+                    y_center = xywh_ratio[1]   # 中心點 Y 比例
+                    y_bottom = y_center + (xywh_ratio[3] / 2)  # 底部 Y 比例 (接地點)
+
+                    # 2. 定義核心「弱勢用路人」清單
+                    vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
+
+                    # 3. 只有偵測到弱勢用路人，且不在天空區域 (Y > 0.45) 時才進行分區判定
+                    if label in vulnerable_road_users and y_center > 0.45:
+                        # 【情況一：正前方核心車道危險區 -> 優先級最高，直接設為 10】
+                        if (0.35 <= x_center <= 0.65) and (0.60 <= y_bottom <= 0.85):
+                            frame_status = "10"
+                        # 【情況二：左右兩側鄰近威脅區 -> 如果目前不是最危險的 10，就設為 01】
+                        elif (0.10 <= x_center < 0.35) and (0.50 <= y_bottom <= 0.85):
+                            if frame_status != "10":
+                                frame_status = "01"
+                        elif (0.65 < x_center <= 0.90) and (0.50 <= y_bottom <= 0.85):
+                            if frame_status != "10":
+                                frame_status = "01"
+
+                # =================================================================
+                # 🎨 每一幀畫面結束後：噴出狀態碼 + 繪製實體電子圍籬格線 (在 for 迴圈外面)
+                # =================================================================
+                # A. 無延遲即時噴出這幀畫面最終的狀態碼，供 Jetson Nano 下位機與馬達同步
+                print(f"{frame_status}")
+
+                # B. 在輸出的影像上，繪製出紅色與橘色的實體 ROI 電子圍籬格線
+                h, w, _ = im0.shape
+                
+                # 繪製中央核心危險區 (10) -> 紅色方框 (線粗=3)
+                c_x1, c_y1 = int(0.35 * w), int(0.60 * h)
+                c_x2, c_y2 = int(0.65 * w), int(0.85 * h)
+                cv2.rectangle(im0, (c_x1, c_y1), (c_x2, c_y2), (0, 0, 255), 3)
+                cv2.putText(im0, f"DANGER ZONE ({frame_status})", (c_x1 + 10, c_y1 + 30), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                # 繪製左側威脅區 (01) -> 橘色方框
+                l_x1, l_y1 = int(0.10 * w), int(0.50 * h)
+                l_x2, l_y2 = int(0.35 * w), int(0.85 * h)
+                cv2.rectangle(im0, (l_x1, l_y1), (l_x2, l_y2), (0, 165, 255), 2)
+                
+                # 繪製右側威脅區 (01) -> 橘色方框
+                r_x1, r_y1 = int(0.65 * w), int(0.50 * h)
+                r_x2, r_y2 = int(0.90 * w), int(0.85 * h)
+                cv2.rectangle(im0, (r_x1, r_y1), (r_x2, r_y2), (0, 165, 255), 2)
+                cv2.putText(im0, "SIDE WARNING (01)", (l_x1 + 10, l_y1 + 25), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 165, 255), 2)
 
             # Stream results
             im0 = annotator.result()
