@@ -312,7 +312,7 @@ def run(
                     
                     # 💎 【進化版智慧補丁】：用「物件形狀」分辨，徹底免疫距離干擾！
                     # 如果 AI 判斷是汽車，但它的形狀是「瘦高型或正方形 (寬高比 < 1.1)」，強制轉正為機車！
-                    if original_class_name == 'car' and aspect_ratio < 1.1: 
+                    if original_class_name == 'car' and aspect_ratio < 0.8: 
                         final_class_name = 'motorcycle' 
                         bbox_color = (255, 105, 180) # 粉紅色標註
                     else:
