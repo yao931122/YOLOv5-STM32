@@ -283,7 +283,9 @@ def run(
 
                 for *xyxy, conf, cls in reversed(det):
                     c = int(cls)
-                    class_name = names[c] 
+                    original_class_name = names[c] # 💡 記錄原廠 AI 抓到的名字 (可能是 'car')
+                    final_class_name = original_class_name # 預設預設 final 名稱為原廠名稱
+                    
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
 
@@ -291,56 +293,70 @@ def run(
                     xywh_ratio = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
                     x_center = xywh_ratio[0]
                     y_center = xywh_ratio[1]
-                    w_ratio = xywh_ratio[2]  
+                    w_ratio = xywh_ratio[2]  # 物件佔據畫面的寬度比例
                     y_bottom = y_center + (xywh_ratio[3] / 2) # 接地點
 
                     # 💡 【過濾左下角反光】
-                    if class_name == 'car' and (x_center < 0.30 and y_center > 0.70):
+                    if original_class_name == 'car' and (x_center < 0.30 and y_center > 0.70):
                         continue 
 
                     # =================================================================
-                    display_label = None if hide_labels else (class_name if hide_conf else f"{class_name} {conf:.2f}")
-                    annotator.box_label(xyxy, display_label, color=colors(c, True))
+                    # 🚀 See Through 畢業製作：【視覺 Override】智慧補丁
+                    # =================================================================
+                    # 💡 我們要在畫框框「之前」，強制把名字改掉！
+                    vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
                     
-                    if save_csv: write_to_csv(p.name, class_name, confidence_str)
+                    is_overridden_vru = False # 記錄是否為強制轉正的 VRU
+
+                    # 💎 【終極智慧補丁】：定點定點清除右側機車误判！
+                    # 如果是汽車，出現在右側(x > 0.65)，寬度不大於 28%(微調 Threshold)，且接地點離我們夠近
+                    if original_class_name == 'car' and x_center > 0.65 and w_ratio < 0.28 and y_bottom > 0.55: 
+                        final_class_name = 'motorcycle' # 🚨 強制 Override 視覺標籤！
+                        is_overridden_vru = True
+                        bbox_color = (255, 105, 180) # 🎨 神來之筆：把誤判的車框改成「粉紅色」，強調工程師的補丁！
+                    
+                    # 全畫面的極窄汽車補丁 (防止鑽車縫誤判)
+                    elif original_class_name == 'car' and w_ratio < 0.15:
+                        final_class_name = 'motorcycle'
+                        is_overridden_vru = True
+                        bbox_color = (255, 105, 180) # 🎨 粉紅色補丁
+                    else:
+                        bbox_color = colors(c, True) # 其餘維持原廠顏色
+
+                    # =================================================================
+                    # 🔥 畫框框邏輯 (現在使用 final_class_name，無視 --nosave)
+                    # =================================================================
+                    # 這裡就會畫上修正後的 final_class_name (即 'motorcycle')！
+                    display_label = None if hide_labels else (final_class_name if hide_conf else f"{final_class_name} {conf:.2f}")
+                    annotator.box_label(xyxy, display_label, color=bbox_color) # 畫上 final 標籤與顏色
+                    
+                    # (CSV/TXT 存檔也建議使用 final_class_name 以利數據分析)
+                    if save_csv: write_to_csv(p.name, final_class_name, confidence_str)
                     if save_txt:  
                         if save_format == 0: coords = ((xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist())
                         else: coords = (torch.tensor(xyxy).view(1, 4) / gn).view(-1).tolist()
                         line = (cls, *coords, conf) if save_conf else (cls, *coords)
                         with open(f"{txt_path}.txt", "a") as f: f.write(("%g " * len(line)).rstrip() % line + "\n")
-                    if save_crop: save_one_box(xyxy, imc, file=save_dir / "crops" / class_name / f"{p.stem}.jpg", BGR=True)
+                    if save_crop: save_one_box(xyxy, imc, file=save_dir / "crops" / final_class_name / f"{p.stem}.jpg", BGR=True)
                     # =================================================================
 
-                    # 🚀 See Through 畢業製作：智慧補丁 + 嚴格中線防禦
-                    vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
-                    is_vru = False
-                    
-                    if class_name in vulnerable_road_users:
-                        is_vru = True
-                    # 🔥【智慧補丁保留】：右側區域(x>0.65)的汽車，只要寬度小於 25%，強制轉為機車！
-                    elif class_name == 'car' and x_center > 0.65 and w_ratio < 0.25: 
-                        is_vru = True
-                    # 全畫面的極窄補丁
-                    elif class_name == 'car' and w_ratio < 0.15:
-                        is_vru = True
-
-                    # 💡 接地點過濾 (y_bottom > 0.55)：只管離車頭夠近的物件
-                    if is_vru and y_bottom > 0.55:
-                        # 【🏆 嚴格中線守護】：只有踩進正前方紅框 (0.35~0.65) 才允許跳 1！
+                    # 🚀 ADAS 二元編碼判定 (0 或 1)
+                    # 這邊只要判斷 final_class_name 是不是 VRU 即可 (因為補丁已經套套用了)
+                    if final_class_name in vulnerable_road_users and y_bottom > 0.55:
+                        # 【🏆 嚴格中線守護】：遵循用戶用戶需求，只有踩進中央紅框 (0.35~0.65) 才跳 1！
                         if (0.35 <= x_center <= 0.65):
                             frame_status = "1"
-                        # 兩側區域就算抓到機車，因為不影響正前方動線，維持 0 不處理。
+                        # 💡 右邊那台被強轉成 motorcycle 的車因為踩在 x > 0.65，所以狀態維持 0，完美！
 
                 # =================================================================
                 # 🎨 HUD 級視覺化 與 實體分類存檔
                 # =================================================================
-                im0 = annotator.result() 
+                im0 = annotator.result() # 把剛剛「強迫畫好」的辨識框真正沖印上 im0
                 overlay = im0.copy() 
 
                 print(f"{frame_status}") 
 
                 h, w, _ = im0.shape
-                
                 # 繪製半透明紅橘陰影
                 c_x1, c_y1 = int(0.35 * w), 0
                 c_x2, c_y2 = int(0.65 * w), h
