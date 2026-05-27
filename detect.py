@@ -279,12 +279,15 @@ def run(
 
                 # Write results
                 frame_status = "0" 
+                
+                # 🎨 A. 先複製一份乾淨的 im0 用來製作科技感陰影 (此時 im0 還沒畫框)
                 overlay = im0.copy()
 
                 for *xyxy, conf, cls in reversed(det):
                     c = int(cls)
+                    # 💡 【關鍵1】：先抓取原廠 AI 算出來的名字 (可能是 'car' 或誤檢的 'motorcycle')
                     original_class_name = names[c] 
-                    final_class_name = original_class_name 
+                    final_class_name = original_class_name # 預設 final 名稱為原廠名稱
                     
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
@@ -294,35 +297,38 @@ def run(
                     x_center = xywh_ratio[0]
                     y_center = xywh_ratio[1]
                     w_ratio = xywh_ratio[2]  # 物件寬度比例
-                    h_ratio = xywh_ratio[3]  # 💡 新增：物件高度比例
+                    h_ratio = xywh_ratio[3]  # 物件高度比例
                     
-                    # 💡 核心武器：計算「物件寬高比」(Aspect Ratio) = 寬度 / 高度
+                    # 💡 【關鍵2】：計算物件「寬高比」= 寬度 / 高度
                     aspect_ratio = w_ratio / h_ratio 
                     
                     y_bottom = y_center + (h_ratio / 2) # 接地點
 
-                    # 💡 【過濾左下角反光】
+                    # 💡 【過濾左下角反光】：定點清除擋風玻璃反光
                     if original_class_name == 'car' and (x_center < 0.30 and y_center > 0.70):
                         continue 
 
                     # =================================================================
-                    # 🚀 See Through 畢業製作：【視覺 Override】幾何學寬高比補丁
+                    # 🚀 See Through 畢業製作：幾何學【視覺 Override】補丁
                     # =================================================================
-                    vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
-                    
-                    # 💎 【進化版智慧補丁】：用「物件形狀」分辨，徹底免疫距離干擾！
-                    # 如果 AI 判斷是汽車，但它的形狀是「瘦高型或正方形 (寬高比 < 1.1)」，強制轉正為機車！
-                    if original_class_name == 'car' and aspect_ratio < 0.8: 
-                        final_class_name = 'motorcycle' 
+                    # 💎 【幾何學補丁】：如果被認成摩托車，但它的形狀是「扁扁的長方形 (寬高比 > 1.2)」
+                    # 🚨 這絕對是誤檢，強制在視覺上把它修正為 'car'！
+                    if final_class_name == 'motorcycle' and aspect_ratio > 1.2: 
+                        final_class_name = 'car' 
+                        # 🎨 🎨 💎 【神來之筆】：把強轉成功的車框改成「粉紅色」，強調工程師的修正！
                         bbox_color = (255, 105, 180) # 粉紅色標註
                     else:
-                        bbox_color = colors(c, True) # 真正的扁長形汽車，維持原廠顏色
+                        # 其餘維持原廠類別顏色 (使用原廠類別類別索引索引c)
+                        bbox_color = colors(c, True)
 
                     # =================================================================
-                    # 畫框與存檔邏輯
+                    # 🔥 畫框邏輯 (現在使用修正後的 final_class_name，並無視 --nosave)
+                    # =================================================================
                     display_label = None if hide_labels else (final_class_name if hide_conf else f"{final_class_name} {conf:.2f}")
+                    # 在 im0 上畫上 final 類別和顏色，此時 im0 變成了「畫框後的實體圖」
                     annotator.box_label(xyxy, display_label, color=bbox_color) 
                     
+                    # (CSV/TXT 存檔也建議使用 final_class_name 以利數據分析)
                     if save_csv: write_to_csv(p.name, final_class_name, confidence_str)
                     if save_txt:  
                         if save_format == 0: coords = ((xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist())
@@ -332,25 +338,28 @@ def run(
                     if save_crop: save_one_box(xyxy, imc, file=save_dir / "crops" / final_class_name / f"{p.stem}.jpg", BGR=True)
                     # =================================================================
 
-                    # 🚀 ADAS 深度與範圍判定
-                    # 深度放寬至 0.45，確保紅框內的物件能順利觸發
+                    # 🚀 ADAS 深度與範圍判定 (0 或 1)
+                    vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
+                    # 深度放寬至 0.45，確保遠處物件能觸發判定
                     if final_class_name in vulnerable_road_users and y_bottom > 0.45:
-                        # 【🏆 嚴格中線守護】：只要踩進中央紅框 (0.35~0.65) 才跳 1！
                         if (0.35 <= x_center <= 0.65):
                             frame_status = "1"
 
                 # =================================================================
-                # 🎨 HUD 級視覺化 與 實體分類存檔
+                # 🎨 HUD 級視覺化：半透明陰影區域標註 (全高度縱向鋪滿版)
                 # =================================================================
-                im0 = annotator.result() # 把剛剛「強迫畫好」的辨識框真正沖印上 im0
-                overlay = im0.copy() 
-
-                print(f"{frame_status}") 
+                print(f"{frame_status}") # 噴出狀態碼
 
                 h, w, _ = im0.shape
-                # 繪製半透明紅橘陰影
+                
+                # 💡 【關鍵修復】：先執行annotator.result()，把畫好的「實體辨識框」沖印沖印上 im0！
+                im0 = annotator.result()
+                
+                # B. 在畫好辨識框的 im0 上方，進行半透明陰影融合，製造 HUD 效果
                 c_x1, c_y1 = int(0.35 * w), 0
                 c_x2, c_y2 = int(0.65 * w), h
+                # C. 核心修復核心修復：這裏要使用從 im0 複製過來的原本 overlay！
+                # 否則陰影下方的 im0 畫布會漏掉 YOLO 的辨識框！
                 cv2.rectangle(overlay, (c_x1, c_y1), (c_x2, c_y2), (0, 0, 255), -1)
                 
                 l_x1, l_y1 = int(0.15 * w), 0
@@ -361,17 +370,22 @@ def run(
                 r_x2, r_y2 = int(0.85 * w), h
                 cv2.rectangle(overlay, (r_x1, r_y1), (r_x2, r_y2), (0, 120, 255), -1)
 
-                alpha, beta = 0.88, 0.12
+                # 關鍵核心：將畫了實心色彩的 overlay 與 已經沖印了辨識框辨識框的 im0 進行淡融合融合
+                # 12% 的極淡透明度 (0.12)，不遮擋夜間視線
+                alpha = 0.88
+                beta = 0.12
                 cv2.addWeighted(overlay, beta, im0, alpha, 0, im0)
                 
+                # 文字提示
                 cv2.putText(im0, f"ADAS: {frame_status}", (c_x1 + 10, int(0.1 * h)), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                 
-                # 📁 實體分類存檔
+                # 📁 畢業製作專屬：實體分類存檔
                 import os
                 save_folder = f"ADAS_Output/Status_{frame_status}"
                 os.makedirs(save_folder, exist_ok=True)
                 custom_save_path = os.path.join(save_folder, p.name)
+                # 將這張融合了「YOLO辨識框」與「HUD淡陰影」的最終圖片存入分類資料夾
                 cv2.imwrite(custom_save_path, im0)
  
 
