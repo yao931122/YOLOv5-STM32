@@ -279,7 +279,6 @@ def run(
 
                 # Write results
                 frame_status = "0" 
-                overlay = im0.copy()
 
                 for *xyxy, conf, cls in reversed(det):
                     c = int(cls)
@@ -291,10 +290,10 @@ def run(
                     xywh_ratio = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()
                     x_center = xywh_ratio[0]
                     y_center = xywh_ratio[1]
-                    w_ratio = xywh_ratio[2]  # 物件佔據畫面的寬度比例
+                    w_ratio = xywh_ratio[2]
                     y_bottom = y_center + (xywh_ratio[3] / 2)
 
-                    # 💡 【過濾左下角反光】：定點清除擋風玻璃反光
+                    # 💡 【過濾左下角反光】
                     if class_name == 'car' and (x_center < 0.30 and y_center > 0.70):
                         continue 
 
@@ -309,74 +308,64 @@ def run(
                         line = (cls, *coords, conf) if save_conf else (cls, *coords)
                         with open(f"{txt_path}.txt", "a") as f:
                             f.write(("%g " * len(line)).rstrip() % line + "\n")
-                    if save_img or save_crop or view_img:  
-                        display_label = None if hide_labels else (class_name if hide_conf else f"{class_name} {conf:.2f}")
-                        annotator.box_label(xyxy, display_label, color=colors(c, True))
+                    
+                    # 🔥 【終極修復】：拔掉 if save_img 條件，無視 --nosave，強迫每隻抓到的物件都必須畫上辨識框！
+                    display_label = None if hide_labels else (class_name if hide_conf else f"{class_name} {conf:.2f}")
+                    annotator.box_label(xyxy, display_label, color=colors(c, True))
+                    
                     if save_crop:
                         save_one_box(xyxy, imc, file=save_dir / "crops" / class_name / f"{p.stem}.jpg", BGR=True)
                     # =================================================================
 
-                    # 🚀 See Through 畢業製作：智慧補丁與二元編碼邏輯
+                    # 🚀 智慧寬度補丁與狀態判定
                     vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
-                    
-                    # 智慧寬度補丁
                     is_vru = False
                     if class_name in vulnerable_road_users:
                         is_vru = True
                     elif class_name == 'car' and w_ratio < 0.15: 
                         is_vru = True
 
-                    # 💡 過濾遠處停放車輛與路邊雜訊
                     if is_vru and y_bottom > 0.55:
-                        # 【中央危險區】：只要物件踩進 0.35 ~ 0.65，狀態立刻切換為 "1"
                         if (0.35 <= x_center <= 0.65):
                             frame_status = "1"
-                        # 左右兩側（0.15~0.35 與 0.65~0.85）在視覺上維持原有 ROI 陰影以提醒駕駛，
-                        # 但在編碼邏輯上屬於「其他情況」，故不改變 frame_status，使其保持預設的 "0"。
 
+                # =================================================================
+                # 🎨 HUD 級視覺化 與 實體分類存檔
+                # =================================================================
+                # 1. 把剛剛「強迫畫好」的辨識框，正式沖印到 im0 實體照片上！
                 im0 = annotator.result()
-                overlay = im0.copy()
                 
-                # 🎨 HUD 級視覺化：維持原有視覺區域，僅更新文字顯示
-                print(f"{frame_status}") # 終端機高頻噴出 0 或 1
+                # 2. 複製一張擁有辨識框的照片，準備畫半透明陰影
+                overlay = im0.copy()
+
+                print(f"{frame_status}") 
 
                 h, w, _ = im0.shape
                 
-                # 紅色中央危險區 (0.35 ~ 0.65)
                 c_x1, c_y1 = int(0.35 * w), 0
                 c_x2, c_y2 = int(0.65 * w), h
                 cv2.rectangle(overlay, (c_x1, c_y1), (c_x2, c_y2), (0, 0, 255), -1)
                 
-                # 橘色左側威脅區 (0.15 ~ 0.35)
                 l_x1, l_y1 = int(0.15 * w), 0
                 l_x2, l_y2 = int(0.35 * w), h
                 cv2.rectangle(overlay, (l_x1, l_y1), (l_x2, l_y2), (0, 120, 255), -1)
                 
-                # 橘色右側威脅區 (0.65 ~ 0.85)
                 r_x1, r_y1 = int(0.65 * w), 0
                 r_x2, r_y2 = int(0.85 * w), h
                 cv2.rectangle(overlay, (r_x1, r_y1), (r_x2, r_y2), (0, 120, 255), -1)
 
-                # 半透明圖層融合
                 alpha, beta = 0.88, 0.12
                 cv2.addWeighted(overlay, beta, im0, alpha, 0, im0)
                 
-                # 在影像畫面上壓上全新的二元 ADAS 提示字樣
                 cv2.putText(im0, f"ADAS: {frame_status}", (c_x1 + 10, int(0.1 * h)), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
                 
+                # 📁 分類存檔
                 import os
-                
-                # 1. 定義你要存放的主資料夾名稱 (直接放在專案根目錄下的 ADAS_Output 裡)
                 save_folder = f"ADAS_Output/Status_{frame_status}"
-                
-                # 2. 如果資料夾還沒被建立，程式會自動幫你建好 (exist_ok=True 讓它不會報錯)
                 os.makedirs(save_folder, exist_ok=True)
                 
-                # 3. 組合出完整的圖片儲存路徑 (例如: ADAS_Output/Status_1/test3.jpg)
                 custom_save_path = os.path.join(save_folder, p.name)
-                
-                # 4. 將畫好 HUD 遮罩的最終圖片存進對應的資料夾
                 cv2.imwrite(custom_save_path, im0)
  
 
