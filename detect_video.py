@@ -208,6 +208,7 @@ def run(
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
+    danger_hold_frames = 0  # 警報維持計數器
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
@@ -268,6 +269,10 @@ def run(
             gn = torch.tensor(im0.shape)[[1, 0, 1, 0]]  # normalization gain whwh
             imc = im0.copy() if save_crop else im0  # for save_crop
             annotator = Annotator(im0, line_width=line_thickness)
+
+            # Write results
+            danger_detected_now = False 
+            
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -277,8 +282,7 @@ def run(
                     n = (det[:, 5] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-                # Write results
-                frame_status = "0" 
+                
                 
                 # 🎨 A. 先複製一份乾淨的 im0 用來製作科技感陰影 (此時 im0 還沒畫框)
                 overlay = im0.copy()
@@ -343,7 +347,17 @@ def run(
                     # 深度放寬至 0.45，確保遠處物件能觸發判定
                     if final_class_name in vulnerable_road_users and y_bottom > 0.45:
                         if (0.35 <= x_center <= 0.65):
-                            frame_status = "1"
+                            danger_detected_now = True
+
+                if danger_detected_now:
+                    danger_hold_frames = 15  # 確實看到危險！補滿 15 幀的警報額度 (大約 0.5 秒)
+                    frame_status = "1"
+                else:
+                    if danger_hold_frames > 0:
+                        danger_hold_frames -= 1  # 沒看到危險，但還有額度，扣除一幀
+                        frame_status = "1"       # 強制維持警報狀態 1！
+                    else:
+                        frame_status = "0"       # 額度扣光了，確認真的安全，解除警報
 
                 # =================================================================
                 # 🎨 HUD 級視覺化：半透明陰影區域標註 (全高度縱向鋪滿版)
