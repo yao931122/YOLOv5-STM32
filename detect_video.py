@@ -52,6 +52,8 @@ import csv
 import os
 import platform
 import sys
+import time
+import serial
 from glob import glob, has_magic
 from pathlib import Path
 
@@ -209,6 +211,21 @@ def run(
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
     danger_hold_frames = 0  # 警報維持計數器
+
+    # ===== 新增：Nano UART 傳送到 STM32 =====
+    SERIAL_PORT = "/dev/ttyUSB0"
+    BAUD_RATE = 115200
+
+    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
+    time.sleep(2)
+
+    last_sent_state = None   # 上一次送給 STM32 的狀態："0" / "1" / None
+    zero_count = 0           # 連續偵測到 0 的幀數
+    ZERO_THRESHOLD = 3       # 連續 3 幀都是 0，才解除警示
+
+    print("[Serial] Nano 已連線 STM32")
+    print("[ADAS] 偵測到 1 立刻送出；連續 3 幀 0 才送出 0")
+    # ===== 新增結束 =====
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
@@ -362,7 +379,32 @@ def run(
                 # =================================================================
                 # 🎨 HUD 級視覺化：半透明陰影區域標註 (全高度縱向鋪滿版)
                 # =================================================================
-                print(f"{frame_status}") # 噴出狀態碼
+                # ===== 新增：ADAS 0/1 傳給 STM32 紅外線發射端 =====
+                print(f"{frame_status}")  # 噴出狀態碼
+
+                if frame_status == "1":
+                    # 只要出現 1，就立刻進入警示
+                    zero_count = 0
+
+                    if last_sent_state != "1":
+                        ser.write(b"1")
+                        ser.flush()
+                        print("[Nano → STM32] 偵測到風險，已送出：1，啟動紅外線警示")
+                        last_sent_state = "1"
+                    else:
+                        print("[ADAS] 維持警示狀態，不重複送 1")
+
+                else:
+                    # 出現 0 時，不立刻解除，而是累積連續 0 的幀數
+                    zero_count += 1
+                    print(f"[ADAS] 目前為 0，連續 0 幀數：{zero_count}/{ZERO_THRESHOLD}")
+
+                    if zero_count >= ZERO_THRESHOLD and last_sent_state != "0":
+                        ser.write(b"0")
+                        ser.flush()
+                        print("[Nano → STM32] 連續 3 幀為 0，已送出：0，解除紅外線警示")
+                        last_sent_state = "0"
+                # ===== 新增結束 =====
 
                 h, w, _ = im0.shape
                 
