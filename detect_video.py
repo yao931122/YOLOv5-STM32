@@ -273,6 +273,21 @@ def run(
             # Write results
             danger_detected_now = False 
             
+            # =================================================================
+            # 💡 1. 建立 AR 透視梯形座標 (使用筆電微調完美的黃金比例)
+            # =================================================================
+            h, w, _ = im0.shape
+            pts = np.array([
+                [int(w * 0.20), h],               # 左下角
+                [int(w * 0.40), int(h * 0.60)],   # 左上角 (消失點)
+                [int(w * 0.60), int(h * 0.60)],   # 右上角 (消失點)
+                [int(w * 0.80), h]                # 右下角
+            ], np.int32)
+            pts = pts.reshape((-1, 1, 2))
+            
+            # 🎨 A. 先複製一份乾淨的 im0 用來製作科技感陰影
+            overlay = im0.copy()
+
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -282,16 +297,11 @@ def run(
                     n = (det[:, 5] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-                
-                
-                # 🎨 A. 先複製一份乾淨的 im0 用來製作科技感陰影 (此時 im0 還沒畫框)
-                overlay = im0.copy()
-
                 for *xyxy, conf, cls in reversed(det):
                     c = int(cls)
-                    # 💡 【關鍵1】：先抓取原廠 AI 算出來的名字 (可能是 'car' 或誤檢的 'motorcycle')
+                    # 💡 先抓取原廠 AI 算出來的名字
                     original_class_name = names[c] 
-                    final_class_name = original_class_name # 預設 final 名稱為原廠名稱
+                    final_class_name = original_class_name 
                     
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
@@ -303,36 +313,30 @@ def run(
                     w_ratio = xywh_ratio[2]  # 物件寬度比例
                     h_ratio = xywh_ratio[3]  # 物件高度比例
                     
-                    # 💡 【關鍵2】：計算物件「寬高比」= 寬度 / 高度
+                    # 💡 計算物件「寬高比」= 寬度 / 高度
                     aspect_ratio = w_ratio / h_ratio 
                     
                     y_bottom = y_center + (h_ratio / 2) # 接地點
 
-                    # 💡 【過濾左下角反光】：定點清除擋風玻璃反光
+                    # 💡 定點清除擋風玻璃反光
                     if original_class_name == 'car' and (x_center < 0.30 and y_center > 0.70):
                         continue 
 
                     # =================================================================
-                    # 🚀 See Through 畢業製作：幾何學【視覺 Override】補丁
+                    # 🚀 幾何學【視覺 Override】補丁
                     # =================================================================
-                    # 💎 【幾何學補丁】：如果被認成摩托車，但它的形狀是「扁扁的長方形 (寬高比 > 1.2)」
-                    # 🚨 這絕對是誤檢，強制在視覺上把它修正為 'car'！
                     if final_class_name == 'motorcycle' and aspect_ratio > 1.2: 
                         final_class_name = 'car' 
-                        # 🎨 🎨 💎 【神來之筆】：把強轉成功的車框改成「粉紅色」，強調工程師的修正！
                         bbox_color = (255, 105, 180) # 粉紅色標註
                     else:
-                        # 其餘維持原廠類別顏色 (使用原廠類別類別索引索引c)
                         bbox_color = colors(c, True)
 
                     # =================================================================
-                    # 🔥 畫框邏輯 (現在使用修正後的 final_class_name，並無視 --nosave)
+                    # 🔥 畫框邏輯
                     # =================================================================
                     display_label = None if hide_labels else (final_class_name if hide_conf else f"{final_class_name} {conf:.2f}")
-                    # 在 im0 上畫上 final 類別和顏色，此時 im0 變成了「畫框後的實體圖」
                     annotator.box_label(xyxy, display_label, color=bbox_color) 
                     
-                    # (CSV/TXT 存檔也建議使用 final_class_name 以利數據分析)
                     if save_csv: write_to_csv(p.name, final_class_name, confidence_str)
                     if save_txt:  
                         if save_format == 0: coords = ((xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist())
@@ -340,69 +344,53 @@ def run(
                         line = (cls, *coords, conf) if save_conf else (cls, *coords)
                         with open(f"{txt_path}.txt", "a") as f: f.write(("%g " * len(line)).rstrip() % line + "\n")
                     if save_crop: save_one_box(xyxy, imc, file=save_dir / "crops" / final_class_name / f"{p.stem}.jpg", BGR=True)
-                    # =================================================================
 
-                    # 🚀 ADAS 深度與範圍判定 (0 或 1)
+                    # =================================================================
+                    # 🚀 ADAS 深度與「新梯形」範圍判定 (使用 pointPolygonTest 連動)
+                    # =================================================================
                     vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
-                    # 深度放寬至 0.45，確保遠處物件能觸發判定
-                    if final_class_name in vulnerable_road_users and y_bottom > 0.45:
-                        if (0.35 <= x_center <= 0.65):
+                    if final_class_name in vulnerable_road_users:
+                        # 將比例轉換回「實際的像素座標」
+                        bottom_center_x = int(x_center * w)
+                        bottom_center_y = int(y_bottom * h)
+                        
+                        # 核心幾何判定：落點是否有踩進新調校的梯形 (pts) 裡面？
+                        if cv2.pointPolygonTest(pts, (bottom_center_x, bottom_center_y), False) >= 0:
                             danger_detected_now = True
 
-                if danger_detected_now:
-                    danger_hold_frames = 15  # 確實看到危險！補滿 15 幀的警報額度 (大約 0.5 秒)
-                    frame_status = "1"
+            # =================================================================
+            # 🔥 2. 防抖結算與狀態碼輸出 (確保連續輸出)
+            # =================================================================
+            if danger_detected_now:
+                danger_hold_frames = 15  # 確實看到危險！補滿 15 幀的警報額度
+                frame_status = "1"
+            else:
+                if danger_hold_frames > 0:
+                    danger_hold_frames -= 1  
+                    frame_status = "1"       
                 else:
-                    if danger_hold_frames > 0:
-                        danger_hold_frames -= 1  # 沒看到危險，但還有額度，扣除一幀
-                        frame_status = "1"       # 強制維持警報狀態 1！
-                    else:
-                        frame_status = "0"       # 額度扣光了，確認真的安全，解除警報
+                    frame_status = "0"       
 
-                # =================================================================
-                # 🎨 HUD 級視覺化：半透明陰影區域標註 (全高度縱向鋪滿版)
-                # =================================================================
-                print(f"{frame_status}") # 噴出狀態碼
+            print(f"目前影格預警狀態 - ADAS: {frame_status}") 
 
-                h, w, _ = im0.shape
-                
-                # 💡 【關鍵修復】：先執行annotator.result()，把畫好的「實體辨識框」沖印沖印上 im0！
-                im0 = annotator.result()
-                
-                # B. 在畫好辨識框的 im0 上方，進行半透明陰影融合，製造 HUD 效果
-                c_x1, c_y1 = int(0.35 * w), 0
-                c_x2, c_y2 = int(0.65 * w), h
-                # C. 核心修復核心修復：這裏要使用從 im0 複製過來的原本 overlay！
-                # 否則陰影下方的 im0 畫布會漏掉 YOLO 的辨識框！
-                cv2.rectangle(overlay, (c_x1, c_y1), (c_x2, c_y2), (0, 0, 255), -1)
-                
-                l_x1, l_y1 = int(0.15 * w), 0
-                l_x2, l_y2 = int(0.35 * w), h
-                cv2.rectangle(overlay, (l_x1, l_y1), (l_x2, l_y2), (0, 120, 255), -1)
-                
-                r_x1, r_y1 = int(0.65 * w), 0
-                r_x2, r_y2 = int(0.85 * w), h
-                cv2.rectangle(overlay, (r_x1, r_y1), (r_x2, r_y2), (0, 120, 255), -1)
-
-                # 關鍵核心：將畫了實心色彩的 overlay 與 已經沖印了辨識框辨識框的 im0 進行淡融合融合
-                # 12% 的極淡透明度 (0.12)，不遮擋夜間視線
-                alpha = 0.88
-                beta = 0.12
-                cv2.addWeighted(overlay, beta, im0, alpha, 0, im0)
-                
-                # 文字提示
-                cv2.putText(im0, f"ADAS: {frame_status}", (c_x1 + 10, int(0.1 * h)), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                
-                # 📁 畢業製作專屬：實體分類存檔
-                #import os
-                #save_folder = f"ADAS_Output/Status_{frame_status}"
-                #os.makedirs(save_folder, exist_ok=True)
-                #custom_save_path = os.path.join(save_folder, p.name)
-                # 將這張融合了「YOLO辨識框」與「HUD淡陰影」的最終圖片存入分類資料夾
-                #cv2.imwrite(custom_save_path, im0)
-                print(f"目前影格預警狀態 - ADAS: {frame_status}")
- 
+            # =================================================================
+            # 🎨 HUD 級視覺化：AR 透視梯形陰影標註
+            # =================================================================
+            # 💡 先執行 annotator.result()，把畫好的「實體辨識框」沖印上 im0
+            im0 = annotator.result()
+            
+            # 在 overlay 上畫出紅色的實心梯形
+            cv2.fillPoly(overlay, [pts], (0, 0, 255))
+            
+            # 將畫了梯形的 overlay 與 已經沖印了辨識框的 im0 進行淡融合
+            alpha = 0.75
+            beta = 0.25
+            cv2.addWeighted(overlay, beta, im0, alpha, 0, im0)
+            
+            # 文字提示 (動態變色：危險變紅字，安全變綠字)
+            text_color = (0, 0, 255) if frame_status == "1" else (0, 255, 0)
+            cv2.putText(im0, f"ADAS: {frame_status}", (int(w * 0.35), int(h * 0.15)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 3)
 
             # Stream results
             im0 = annotator.result()
