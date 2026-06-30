@@ -9,7 +9,7 @@ import torch.nn as nn
 #from ultralytics.utils.patches import torch_load
 
 def torch_load(fp, map_location=None):
-    return torch.load(fp, map_location=map_location)
+    return torch.load(fp, map_location=map_location, weights_only=False)
 from utils.downloads import attempt_download
 
 

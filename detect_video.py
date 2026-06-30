@@ -275,21 +275,102 @@ def run(
             # Write results
             danger_detected_now = False 
             
-            # =================================================================
-            # 💡 1. 建立 AR 透視梯形座標 (使用筆電微調完美的黃金比例)
-            # =================================================================
             h, w, _ = im0.shape
-            pts = np.array([
-                [int(w * 0.20), h],               # 左下角
-                [int(w * 0.40), int(h * 0.60)],   # 左上角 (消失點)
-                [int(w * 0.60), int(h * 0.60)],   # 右上角 (消失點)
-                [int(w * 0.80), h]                # 右下角
-            ], np.int32)
-            pts = pts.reshape((-1, 1, 2))
-            
-            # 🎨 A. 先複製一份乾淨的 im0 用來製作科技感陰影
+
+            # =================================================================
+            # 💡 新邏輯：先定義一個「大梯形」的左右邊界斜線方程式，
+            # 再用水平線在不同高度切出近/中/遠三層，確保所有層級的
+            # 左右邊界都精確落在同一條斜線上，不會有轉折/上翹的問題
+            # =================================================================
+
+            # 大梯形的四個關鍵控制點（最寬的底部 與 最窄的頂部）
+            BOTTOM_Y = 1.00   # 畫面最底部
+            TOP_Y    = 0.52   # 整個ROI系統的最頂端（消失點附近）→ 比上次收回一點，避免拉太遠上翹
+
+            # 中央車道：底部寬、頂部窄 → 再放寬一點
+            CENTER_BOTTOM_L, CENTER_BOTTOM_R = 0.20, 0.80
+            CENTER_TOP_L,    CENTER_TOP_R    = 0.45, 0.55
+
+            # 左側相鄰車道：底部寬、頂部窄（接在中央車道左邊）
+            LEFT_BOTTOM_L, LEFT_BOTTOM_R = -0.12, 0.20
+            LEFT_TOP_L,    LEFT_TOP_R    = 0.37, 0.45
+
+            # 右側相鄰車道：底部寬、頂部窄（接在中央車道右邊）
+            RIGHT_BOTTOM_L, RIGHT_BOTTOM_R = 0.80, 1.12
+            RIGHT_TOP_L,    RIGHT_TOP_R    = 0.55, 0.63
+
+            # 三層的水平切割線（高度比例），數字越小越接近消失點
+            # 近端再拉長（1.00→0.68，原本只到0.75）
+            LAYER_Y = {
+                "near": (1.00, 0.68),   # 近端：底部 -> 0.68h（再拉長）
+                "mid":  (0.68, 0.58),   # 中端：0.68h -> 0.58h
+                "far":  (0.58, 0.52),   # 遠端：0.58h -> 0.52h
+            }
+
+            def lerp(a, b, t):
+                """線性插值：在 a 到 b 之間，依比例 t 取值"""
+                return a + (b - a) * t
+
+            def x_on_edge(bottom_x, top_x, y_ratio):
+                """
+                給定一條從(bottom_x, BOTTOM_Y)到(top_x, TOP_Y)的斜線，
+                求這條線在某個 y_ratio 高度時的 x 座標
+                """
+                t = (BOTTOM_Y - y_ratio) / (BOTTOM_Y - TOP_Y)
+                return lerp(bottom_x, top_x, t)
+
+            def make_layer_trapezoid(bottom_l, bottom_r, top_l, top_r, y_bottom, y_top):
+                """
+                依「左右兩條邊界斜線」與「指定的上下高度」，算出該層梯形的四個頂點。
+                這樣同一個方向(中/左/右)的三層，左右邊界永遠落在同一條斜線上。
+                """
+                left_bottom_x  = x_on_edge(bottom_l, top_l, y_bottom)
+                left_top_x     = x_on_edge(bottom_l, top_l, y_top)
+                right_bottom_x = x_on_edge(bottom_r, top_r, y_bottom)
+                right_top_x    = x_on_edge(bottom_r, top_r, y_top)
+
+                pts = np.array([
+                    [int(left_bottom_x * w),  int(y_bottom * h)],  # 左下
+                    [int(left_top_x * w),     int(y_top * h)],     # 左上
+                    [int(right_top_x * w),    int(y_top * h)],     # 右上
+                    [int(right_bottom_x * w), int(y_bottom * h)],  # 右下
+                ], np.int32)
+                return pts.reshape((-1, 1, 2))
+
+            # ---- 依三層高度，分別產生中央/左側/右側的梯形 ----
+            roi_zones = {}
+            for depth, (y_b, y_t) in LAYER_Y.items():
+                roi_zones[("center", depth)] = make_layer_trapezoid(
+                    CENTER_BOTTOM_L, CENTER_BOTTOM_R, CENTER_TOP_L, CENTER_TOP_R, y_b, y_t
+                )
+                roi_zones[("left", depth)] = make_layer_trapezoid(
+                    LEFT_BOTTOM_L, LEFT_BOTTOM_R, LEFT_TOP_L, LEFT_TOP_R, y_b, y_t
+                )
+                roi_zones[("right", depth)] = make_layer_trapezoid(
+                    RIGHT_BOTTOM_L, RIGHT_BOTTOM_R, RIGHT_TOP_L, RIGHT_TOP_R, y_b, y_t
+                )
+
+            # 🎨 先複製一份乾淨的 im0 用來製作科技感陰影
             overlay = im0.copy()
 
+            pos_colors = {
+                "center": (0, 0, 255),     # 紅色 (BGR)
+                "left":   (0, 140, 255),   # 橘色
+                "right":  (0, 140, 255),   # 橘色
+            }
+            depth_alpha = {
+                "near": 0.65,
+                "mid":  0.45,
+                "far":  0.30,
+            }
+
+            for (pos, depth), pts in roi_zones.items():
+                color = pos_colors[pos]
+                alpha = depth_alpha[depth]
+                temp = overlay.copy()
+                cv2.fillPoly(temp, [pts], color)
+                cv2.addWeighted(temp, alpha, overlay, 1 - alpha, 0, overlay)
+                cv2.polylines(overlay, [pts], isClosed=True, color=color, thickness=1)
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -381,8 +462,6 @@ def run(
             # 💡 先執行 annotator.result()，把畫好的「實體辨識框」沖印上 im0
             im0 = annotator.result()
             
-            # 在 overlay 上畫出紅色的實心梯形
-            cv2.fillPoly(overlay, [pts], (0, 0, 255))
             
             # 將畫了梯形的 overlay 與 已經沖印了辨識框的 im0 進行淡融合
             alpha = 0.75
