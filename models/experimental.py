@@ -7,10 +7,13 @@ import numpy as np
 import torch
 import torch.nn as nn
 #from ultralytics.utils.patches import torch_load
-
-def torch_load(fp, map_location=None):
-    return torch.load(fp, map_location=map_location, weights_only=False)
 from utils.downloads import attempt_download
+def torch_load(fp, map_location=None):
+    try:
+        return torch.load(fp, map_location=map_location, weights_only=False)
+    except TypeError:
+        return torch.load(fp, map_location=map_location)
+
 
 
 class Sum(nn.Module):
