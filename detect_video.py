@@ -224,6 +224,7 @@ def run(
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
     danger_hold_frames = 0  # 警報維持計數器
+    current_level = 0
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
@@ -287,6 +288,7 @@ def run(
 
             # Write results
             danger_detected_now = False 
+            danger_level_now = 0
             
             h, w, _ = im0.shape
 
@@ -471,43 +473,75 @@ def run(
                             if depth not in active_depths:
                                 continue
                             if cv2.pointPolygonTest(zone_pts, (bottom_center_x, bottom_center_y), False) >= 0:
-                                danger_detected_now = True
-                                break
+                                # 依 pos + depth + current_speed 判斷等級
+                                if pos == "center" and depth == "near":
+                                    detected_level = 3
+                                elif pos == "center" and depth == "mid" and current_speed >= 51:
+                                    detected_level = 3
+                                elif pos == "left" or pos == "right":
+                                    if depth == "near" and current_speed >= 51:
+                                        detected_level = 3
+                                    elif depth == "near" and current_speed <= 50:
+                                        detected_level = 2
+                                    elif depth == "mid":
+                                        detected_level = 2
+                                    elif depth == "far":
+                                        detected_level = 1
+                                    else:
+                                        detected_level = 1
+                                elif pos == "center" and depth == "mid":
+                                    detected_level = 2
+                                elif pos == "center" and depth == "far":
+                                    detected_level = 2
+                                else:
+                                    detected_level = 1
+                                # 只保留最高等級
+                                if detected_level > danger_level_now:
+                                    danger_level_now = detected_level
 
-            # =================================================================
-            # 🔥 2. 防抖結算與狀態碼輸出 (確保連續輸出)
-            # =================================================================
-            if danger_detected_now:
-                danger_hold_frames = 15  # 確實看到危險！補滿 15 幀的警報額度
-                frame_status = "1"
+            # 防抖結算：保留最高等級
+            if danger_level_now > 0:
+                danger_hold_frames = 15
+                current_level = danger_level_now
             else:
                 if danger_hold_frames > 0:
-                    danger_hold_frames -= 1  
-                    frame_status = "1"       
+                    danger_hold_frames -= 1
+                    # current_level 維持上一幀的值，不動（防抖期間保持警示）
                 else:
-                    frame_status = "0"       
+                    current_level = 0
 
-            print(f"目前影格預警狀態 - ADAS: {frame_status}") 
+            # 依等級決定燈號顏色與 UART 編碼
+            if current_speed == 0:
+                led_color = (0, 255, 0)       # 綠色：靜止
+                uart_code = "AA 00"
+            elif current_level == 0:
+                led_color = (0, 255, 0)       # 綠色：無危險
+                uart_code = "AA 10"
+            elif current_level == 1:
+                led_color = (0, 255, 255)     # 黃色 (BGR)
+                uart_code = "AA 11"
+            elif current_level == 2:
+                led_color = (0, 140, 255)     # 橘色 (BGR)
+                uart_code = "AA 12"
+            else:
+                led_color = (0, 0, 255)       # 紅色 (BGR)
+                uart_code = "AA 13"
 
-            # =================================================================
-            # 🎨 HUD 級視覺化：AR 透視梯形陰影標註
-            # =================================================================
-            # 💡 先執行 annotator.result()，把畫好的「實體辨識框」沖印上 im0
+            # 終端機印出 UART 編碼
+            print(f"UART: {uart_code}  |  Level: {current_level}  |  Speed: {current_speed} km/h")
+
+            # HUD 疊合 overlay
             im0 = annotator.result()
-            
-            
-            # 將畫了梯形的 overlay 與 已經沖印了辨識框的 im0 進行淡融合
-            alpha = 0.75
-            beta = 0.25
-            cv2.addWeighted(overlay, beta, im0, alpha, 0, im0)
-            
-            # 文字提示 (動態變色：危險變紅字，安全變綠字)
-            text_color = (0, 0, 255) if frame_status == "1" else (0, 255, 0)
-            cv2.putText(im0, f"ADAS: {frame_status}", (int(w * 0.35), int(h * 0.15)), 
-                        cv2.FONT_HERSHEY_SIMPLEX, 1.2, text_color, 3)
-            
-            cv2.putText(im0, f"Speed: {current_speed} km/h", 
-                        (int(w * 0.35), int(h * 0.22)),
+            cv2.addWeighted(overlay, 0.25, im0, 0.75, 0, im0)
+
+            # 畫面左上角：圓形燈號
+            led_center = (40, 40)
+            cv2.circle(im0, led_center, 22, led_color, -1)           # 實心圓
+            cv2.circle(im0, led_center, 22, (255, 255, 255), 2)      # 白色外框
+
+            # 畫面左上角：車速文字（燈號右側）
+            cv2.putText(im0, f"{current_speed} km/h",
+                        (75, 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 1.0,
                         (255, 255, 255), 2)
 
