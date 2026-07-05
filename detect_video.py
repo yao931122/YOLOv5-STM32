@@ -296,6 +296,7 @@ def run(
             # Write results
             danger_detected_now = False 
             danger_level_now = 0
+            vru_counter = {"person": 0, "motorcycle": 0, "bicycle": 0}
             
             h, w, _ = im0.shape
 
@@ -471,6 +472,58 @@ def run(
                     # =================================================================
                     # 🚀 ADAS 深度與「新梯形」範圍判定 (使用 pointPolygonTest 連動)
                     # =================================================================
+                    # =================================================================
+                    # 💡 駕駛過濾邏輯：區分真實行人與摩托車/腳踏車駕駛
+                    # =================================================================
+                    def calc_iou(boxA, boxB):
+                        """計算兩個框的 IOU（Intersection over Union）"""
+                        xA = max(boxA[0], boxB[0])
+                        yA = max(boxA[1], boxB[1])
+                        xB = min(boxA[2], boxB[2])
+                        yB = min(boxA[3], boxB[3])
+                        interW = max(0, xB - xA)
+                        interH = max(0, yB - yA)
+                        interArea = interW * interH
+                        if interArea == 0:
+                            return 0.0
+                        areaA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+                        areaB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+                        return interArea / float(areaA + areaB - interArea)
+
+                    def is_rider(person_box, vehicle_box):
+                        """
+                        判斷一個 person 框是否為摩托車/腳踏車的駕駛
+                        條件一：person 框底部在 vehicle 框中線以上（位置判斷）
+                        條件二：IOU 大於 0.2（重疊率判斷）
+                        兩個條件同時成立才判定為駕駛
+                        """
+                        person_bottom = person_box[3]
+                        vehicle_mid_y = (vehicle_box[1] + vehicle_box[3]) / 2
+                        position_ok = person_bottom <= vehicle_mid_y * 1.2  # 加一點緩衝
+                        iou_ok = calc_iou(person_box, vehicle_box) >= 0.2
+                        return position_ok or iou_ok
+
+                    # 先整理這一幀所有偵測到的物件
+                    # det_boxes 格式：{類別名稱: [list of (x1,y1,x2,y2)]}
+                    # 注意：這段要放在 for *xyxy, conf, cls in reversed(det): 迴圈外面
+                    # 所以這裡只處理當前這個目標物
+
+                    # 判斷當前目標是否為騎乘者（person 且跟附近車輛重疊）
+                    if final_class_name == 'person':
+                        is_driver = False
+                        for *v_xyxy, v_conf, v_cls in reversed(det):
+                            v_class = model.names[int(v_cls)]
+                            if v_class in ['motorcycle', 'bicycle']:
+                                v_box = [int(v_xyxy[0]), int(v_xyxy[1]),
+                                         int(v_xyxy[2]), int(v_xyxy[3])]
+                                p_box = [int(xyxy[0]), int(xyxy[1]),
+                                         int(xyxy[2]), int(xyxy[3])]
+                                if is_rider(p_box, v_box):
+                                    is_driver = True
+                                    break
+                        if is_driver:
+                            final_class_name = 'rider'  # 標記為騎乘者，跳過弱勢用路人判定
+
                     vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
                     if final_class_name in vulnerable_road_users:
                         bottom_center_x = int(x_center * w)
@@ -480,7 +533,6 @@ def run(
                             if depth not in active_depths:
                                 continue
                             if cv2.pointPolygonTest(zone_pts, (bottom_center_x, bottom_center_y), False) >= 0:
-                                # 依 pos + depth + current_speed 判斷等級
                                 if pos == "center" and depth == "near":
                                     detected_level = 3
                                 elif pos == "center" and depth == "mid" and current_speed >= 51:
@@ -502,9 +554,9 @@ def run(
                                     detected_level = 2
                                 else:
                                     detected_level = 1
-                                # 只保留最高等級
                                 if detected_level > danger_level_now:
                                     danger_level_now = detected_level
+                                vru_counter[final_class_name] += 1 
 
             # 防抖結算：保留最高等級
             if danger_level_now > 0:
@@ -535,7 +587,14 @@ def run(
                 uart_code = "AA 13"
 
             # 終端機印出 UART 編碼
-            print(f"UART: {uart_code}  |  Level: {current_level}  |  Speed: {current_speed} km/h")
+            # 整理 VRU 統計字串
+            vru_summary = " | " + " ".join(
+                f"{v} {k}{'s' if v > 1 else ''}"
+                for k, v in vru_counter.items() if v > 0
+            ) if any(v > 0 for v in vru_counter.values()) else ""
+
+            print(f"UART: {uart_code}  |  Level: {current_level}  |  Speed: {current_speed} km/h{vru_summary}")
+          
 
             # HUD 疊合 overlay
             im0 = annotator.result()
@@ -581,7 +640,7 @@ def run(
                     vid_writer[i].write(im0)
 
         # Print time (inference-only)
-        LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
+        #LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
 
     # Print results
     t = tuple(x.t / seen * 1e3 for x in dt)  # speeds per image
