@@ -52,6 +52,8 @@ import csv
 import os
 import platform
 import sys
+import serial
+import time
 from glob import glob, has_magic
 from pathlib import Path
 
@@ -171,6 +173,32 @@ def run(
         ```
     """
     import csv as _csv
+    # =========================================================
+    # Nano → STM32 UART 設定
+    # =========================================================
+    UART_PORT = "/dev/ttyUSB0"
+    UART_BAUD = 115200
+
+    try:
+        stm32_uart = serial.Serial(
+            port=UART_PORT,
+            baudrate=UART_BAUD,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.1,
+            write_timeout=0.1
+        )
+
+        time.sleep(2)
+        stm32_uart.reset_input_buffer()
+        stm32_uart.reset_output_buffer()
+
+        print(f"✅ STM32 UART 已連線：{UART_PORT}, {UART_BAUD} baud")
+
+    except serial.SerialException as e:
+        stm32_uart = None
+        print(f"❌ STM32 UART 連線失敗：{e}")
 
     speed_profile = {}
     csv_speed_path = speed  # CSV 檔案放在專案根目錄
@@ -232,6 +260,10 @@ def run(
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
     danger_hold_frames = 0  # 警報維持計數器
     current_level = 0
+
+    # 記錄上一個已傳送事件，避免每一幀重複傳送
+    last_uart_event = None
+
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
@@ -569,31 +601,65 @@ def run(
                 else:
                     current_level = 0
 
-            # 依等級決定燈號顏色與 UART 編碼
+            # =========================================================
+            # 依目前狀態決定燈號與 Nano → STM32 事件碼
+            # =========================================================
             if current_speed == 0:
-                led_color = (0, 255, 0)       # 綠色：靜止
-                uart_code = "AA 00"
-            elif current_level == 0:
-                led_color = (0, 255, 0)       # 綠色：無危險
-                uart_code = "AA 10"
-            elif current_level == 1:
-                led_color = (0, 255, 255)     # 黃色 (BGR)
-                uart_code = "AA 11"
-            elif current_level == 2:
-                led_color = (0, 140, 255)     # 橘色 (BGR)
-                uart_code = "AA 12"
-            else:
-                led_color = (0, 0, 255)       # 紅色 (BGR)
-                uart_code = "AA 13"
+                led_color = (0, 255, 0)       # 綠色：車輛靜止
+                uart_event = 0x00
 
-            # 終端機印出 UART 編碼
+            elif current_level == 0:
+                led_color = (0, 255, 0)       # 綠色：行進中安全
+                uart_event = 0x10
+
+            elif current_level == 1:
+                led_color = (0, 255, 255)     # 黃色：Level 1
+                uart_event = 0x11
+
+            elif current_level == 2:
+                led_color = (0, 140, 255)     # 橘色：Level 2
+                uart_event = 0x12
+
+            else:
+                led_color = (0, 0, 255)       # 紅色：Level 3
+                uart_event = 0x13
+
+            # 顯示用字串，例如 AA 12
+            uart_code = f"AA {uart_event:02X}"
+
+            # =========================================================
+            # 只有事件改變時，才真正傳送給 STM32
+            # 封包格式固定為兩個 Byte：[0xAA, 事件碼]
+            # =========================================================
+            uart_status = "UNCHANGED"
+
+            if uart_event != last_uart_event:
+                if stm32_uart is not None and stm32_uart.is_open:
+                    try:
+                        uart_packet = bytes([0xAA, uart_event])
+                        stm32_uart.write(uart_packet)
+                        stm32_uart.flush()
+
+                        last_uart_event = uart_event
+                        uart_status = "TX"
+
+                    except serial.SerialException as e:
+                        uart_status = f"TX ERROR: {e}"
+                else:
+                    uart_status = "NO UART"
+
             # 整理 VRU 統計字串
             vru_summary = " | " + " ".join(
                 f"{v} {k}{'s' if v > 1 else ''}"
                 for k, v in vru_counter.items() if v > 0
             ) if any(v > 0 for v in vru_counter.values()) else ""
 
-            print(f"UART: {uart_code}  |  Level: {current_level}  |  Speed: {current_speed} km/h{vru_summary}")
+            print(
+                f"UART: {uart_code} ({uart_status})"
+                f" | Level: {current_level}"
+                f" | Speed: {current_speed} km/h"
+                f"{vru_summary}"
+            )
           
 
             # HUD 疊合 overlay
@@ -650,6 +716,10 @@ def run(
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
     if update:
         strip_optimizer(weights[0])  # update model (to fix SourceChangeWarning)
+        
+    if stm32_uart is not None and stm32_uart.is_open:
+        stm32_uart.close()
+        print("STM32 UART 已關閉")
 
 
 def parse_opt():
