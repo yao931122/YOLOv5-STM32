@@ -52,12 +52,12 @@ import csv
 import os
 import platform
 import sys
-import time
-import serial
 from glob import glob, has_magic
 from pathlib import Path
 
 import torch
+import numpy as np
+import cv2
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[0]  # YOLOv5 root directory
@@ -119,6 +119,7 @@ def run(
     half=False,  # use FP16 half-precision inference
     dnn=False,  # use OpenCV DNN for ONNX inference
     vid_stride=1,  # video frame-rate stride
+    speed="speed_profile.csv",
 ):
     """Runs YOLOv5 detection inference on various sources like images, videos, directories, streams, etc.
 
@@ -169,7 +170,26 @@ def run(
         run(source='data/videos/example.mp4', weights='yolov5s.pt', conf_thres=0.4, device='0')
         ```
     """
+    import csv as _csv
+
+    speed_profile = {}
+    csv_speed_path = speed  # CSV 檔案放在專案根目錄
+    try:
+        with open(csv_speed_path, "r") as f:
+            reader = _csv.DictReader(f)
+            for row in reader:
+                speed_profile[int(row["time_sec"])] = int(row["speed_kmh"])
+        print(f"✅ 車速時序檔案載入成功，共 {len(speed_profile)} 筆資料")
+    except FileNotFoundError:
+        print(f"⚠️  找不到 {csv_speed_path}，車速預設為 0（所有 ROI 關閉）")
+ 
     source = str(source)
+    # 自動讀取影片 FPS
+    import cv2 as _cv2
+    _cap = _cv2.VideoCapture(source)
+    fps = _cap.get(_cv2.CAP_PROP_FPS) if _cap.isOpened() else 30
+    _cap.release()
+    print(f"✅ 影片 FPS：{fps}")
     is_file = Path(source).suffix[1:] in (IMG_FORMATS + VID_FORMATS)
     is_url = source.lower().startswith(("rtsp://", "rtmp://", "http://", "https://"))
     webcam = source.isnumeric() or source.endswith(".streams") or (is_url and not is_file)
@@ -211,21 +231,7 @@ def run(
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
     seen, windows, dt = 0, [], (Profile(device=device), Profile(device=device), Profile(device=device))
     danger_hold_frames = 0  # 警報維持計數器
-
-    # ===== 新增：Nano UART 傳送到 STM32 =====
-    SERIAL_PORT = "/dev/ttyUSB0"
-    BAUD_RATE = 115200
-
-    ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
-    time.sleep(2)
-
-    last_sent_state = None   # 上一次送給 STM32 的狀態："0" / "1" / None
-    zero_count = 0           # 連續偵測到 0 的幀數
-    ZERO_THRESHOLD = 3       # 連續 3 幀都是 0，才解除警示
-
-    print("[Serial] Nano 已連線 STM32")
-    print("[ADAS] 偵測到 1 立刻送出；連續 3 幀 0 才送出 0")
-    # ===== 新增結束 =====
+    current_level = 0
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
             im = torch.from_numpy(im).to(model.device)
@@ -289,7 +295,123 @@ def run(
 
             # Write results
             danger_detected_now = False 
+            danger_level_now = 0
+            vru_counter = {"person": 0, "motorcycle": 0, "bicycle": 0}
             
+            h, w, _ = im0.shape
+
+            current_time_sec = int(frame / fps)  # 30 FPS，幀數除以 FPS 取得秒數
+            current_speed = speed_profile.get(current_time_sec, 0)  # 查表，找不到預設 0
+ 
+            # 依車速決定哪些深度層要啟用
+            if current_speed == 0:
+                active_depths = []                        # 靜止不預警
+            elif 1 <= current_speed <= 30:
+                active_depths = ["near"]                  # 低速：只開近端
+            elif 31 <= current_speed <= 50:
+                active_depths = ["near", "mid"]           # 中速：近端＋中端
+            else:
+                active_depths = ["near", "mid", "far"]    # 高速：全開
+
+            # =================================================================
+            # 💡 新邏輯：先定義一個「大梯形」的左右邊界斜線方程式，
+            # 再用水平線在不同高度切出近/中/遠三層，確保所有層級的
+            # 左右邊界都精確落在同一條斜線上，不會有轉折/上翹的問題
+            # =================================================================
+
+            # 大梯形的四個關鍵控制點（最寬的底部 與 最窄的頂部）
+            BOTTOM_Y = 1.00   # 畫面最底部
+            TOP_Y    = 0.52   # 整個ROI系統的最頂端（消失點附近）→ 比上次收回一點，避免拉太遠上翹
+
+            # 中央車道：底部寬、頂部窄 → 再放寬一點
+            CENTER_BOTTOM_L, CENTER_BOTTOM_R = 0.20, 0.80
+            CENTER_TOP_L,    CENTER_TOP_R    = 0.45, 0.55
+
+            # 左側相鄰車道：底部寬、頂部窄（接在中央車道左邊）
+            LEFT_BOTTOM_L, LEFT_BOTTOM_R = -0.12, 0.20
+            LEFT_TOP_L,    LEFT_TOP_R    = 0.37, 0.45
+
+            # 右側相鄰車道：底部寬、頂部窄（接在中央車道右邊）
+            RIGHT_BOTTOM_L, RIGHT_BOTTOM_R = 0.80, 1.12
+            RIGHT_TOP_L,    RIGHT_TOP_R    = 0.55, 0.63
+
+            # 三層的水平切割線（高度比例），數字越小越接近消失點
+            # 近端再拉長（1.00→0.68，原本只到0.75）
+            LAYER_Y = {
+                "near": (1.00, 0.68),   # 近端：底部 -> 0.68h（再拉長）
+                "mid":  (0.68, 0.58),   # 中端：0.68h -> 0.58h
+                "far":  (0.58, 0.52),   # 遠端：0.58h -> 0.52h
+            }
+
+            def lerp(a, b, t):
+                """線性插值：在 a 到 b 之間，依比例 t 取值"""
+                return a + (b - a) * t
+
+            def x_on_edge(bottom_x, top_x, y_ratio):
+                """
+                給定一條從(bottom_x, BOTTOM_Y)到(top_x, TOP_Y)的斜線，
+                求這條線在某個 y_ratio 高度時的 x 座標
+                """
+                t = (BOTTOM_Y - y_ratio) / (BOTTOM_Y - TOP_Y)
+                return lerp(bottom_x, top_x, t)
+
+            def make_layer_trapezoid(bottom_l, bottom_r, top_l, top_r, y_bottom, y_top):
+                """
+                依「左右兩條邊界斜線」與「指定的上下高度」，算出該層梯形的四個頂點。
+                這樣同一個方向(中/左/右)的三層，左右邊界永遠落在同一條斜線上。
+                """
+                left_bottom_x  = x_on_edge(bottom_l, top_l, y_bottom)
+                left_top_x     = x_on_edge(bottom_l, top_l, y_top)
+                right_bottom_x = x_on_edge(bottom_r, top_r, y_bottom)
+                right_top_x    = x_on_edge(bottom_r, top_r, y_top)
+
+                pts = np.array([
+                    [int(left_bottom_x * w),  int(y_bottom * h)],  # 左下
+                    [int(left_top_x * w),     int(y_top * h)],     # 左上
+                    [int(right_top_x * w),    int(y_top * h)],     # 右上
+                    [int(right_bottom_x * w), int(y_bottom * h)],  # 右下
+                ], np.int32)
+                return pts.reshape((-1, 1, 2))
+
+            # ---- 依三層高度，分別產生中央/左側/右側的梯形 ----
+            roi_zones = {}
+            for depth, (y_b, y_t) in LAYER_Y.items():
+                roi_zones[("center", depth)] = make_layer_trapezoid(
+                    CENTER_BOTTOM_L, CENTER_BOTTOM_R, CENTER_TOP_L, CENTER_TOP_R, y_b, y_t
+                )
+                roi_zones[("left", depth)] = make_layer_trapezoid(
+                    LEFT_BOTTOM_L, LEFT_BOTTOM_R, LEFT_TOP_L, LEFT_TOP_R, y_b, y_t
+                )
+                roi_zones[("right", depth)] = make_layer_trapezoid(
+                    RIGHT_BOTTOM_L, RIGHT_BOTTOM_R, RIGHT_TOP_L, RIGHT_TOP_R, y_b, y_t
+                )
+
+            # 🎨 先複製一份乾淨的 im0 用來製作科技感陰影
+            overlay = im0.copy()
+
+            pos_colors = {
+                "center": (0, 0, 255),     # 紅色 (BGR)
+                "left":   (0, 140, 255),   # 橘色
+                "right":  (0, 140, 255),   # 橘色
+            }
+            depth_alpha = {
+                "near": 0.65,
+                "mid":  0.45,
+                "far":  0.30,
+            }
+
+            for (pos, depth), pts in roi_zones.items():
+                if depth not in active_depths:
+                    continue  # 這層沒啟用，跳過不畫
+ 
+                color = pos_colors[pos]
+                alpha = depth_alpha[depth]
+                temp = overlay.copy()
+                cv2.fillPoly(temp, [pts], color)
+                cv2.addWeighted(temp, alpha, overlay, 1 - alpha, 0, overlay)
+                cv2.polylines(overlay, [pts], isClosed=True, color=color, thickness=1)
+
+
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_boxes(im.shape[2:], det[:, :4], im0.shape).round()
@@ -299,16 +421,11 @@ def run(
                     n = (det[:, 5] == c).sum()  # detections per class
                     s += f"{n} {names[int(c)]}{'s' * (n > 1)}, "  # add to string
 
-                
-                
-                # 🎨 A. 先複製一份乾淨的 im0 用來製作科技感陰影 (此時 im0 還沒畫框)
-                overlay = im0.copy()
-
                 for *xyxy, conf, cls in reversed(det):
                     c = int(cls)
-                    # 💡 【關鍵1】：先抓取原廠 AI 算出來的名字 (可能是 'car' 或誤檢的 'motorcycle')
+                    # 💡 先抓取原廠 AI 算出來的名字
                     original_class_name = names[c] 
-                    final_class_name = original_class_name # 預設 final 名稱為原廠名稱
+                    final_class_name = original_class_name 
                     
                     confidence = float(conf)
                     confidence_str = f"{confidence:.2f}"
@@ -320,36 +437,30 @@ def run(
                     w_ratio = xywh_ratio[2]  # 物件寬度比例
                     h_ratio = xywh_ratio[3]  # 物件高度比例
                     
-                    # 💡 【關鍵2】：計算物件「寬高比」= 寬度 / 高度
+                    # 💡 計算物件「寬高比」= 寬度 / 高度
                     aspect_ratio = w_ratio / h_ratio 
                     
                     y_bottom = y_center + (h_ratio / 2) # 接地點
 
-                    # 💡 【過濾左下角反光】：定點清除擋風玻璃反光
+                    # 💡 定點清除擋風玻璃反光
                     if original_class_name == 'car' and (x_center < 0.30 and y_center > 0.70):
                         continue 
 
                     # =================================================================
-                    # 🚀 See Through 畢業製作：幾何學【視覺 Override】補丁
+                    # 🚀 幾何學【視覺 Override】補丁
                     # =================================================================
-                    # 💎 【幾何學補丁】：如果被認成摩托車，但它的形狀是「扁扁的長方形 (寬高比 > 1.2)」
-                    # 🚨 這絕對是誤檢，強制在視覺上把它修正為 'car'！
                     if final_class_name == 'motorcycle' and aspect_ratio > 1.2: 
                         final_class_name = 'car' 
-                        # 🎨 🎨 💎 【神來之筆】：把強轉成功的車框改成「粉紅色」，強調工程師的修正！
                         bbox_color = (255, 105, 180) # 粉紅色標註
                     else:
-                        # 其餘維持原廠類別顏色 (使用原廠類別類別索引索引c)
                         bbox_color = colors(c, True)
 
                     # =================================================================
-                    # 🔥 畫框邏輯 (現在使用修正後的 final_class_name，並無視 --nosave)
+                    # 🔥 畫框邏輯
                     # =================================================================
                     display_label = None if hide_labels else (final_class_name if hide_conf else f"{final_class_name} {conf:.2f}")
-                    # 在 im0 上畫上 final 類別和顏色，此時 im0 變成了「畫框後的實體圖」
                     annotator.box_label(xyxy, display_label, color=bbox_color) 
                     
-                    # (CSV/TXT 存檔也建議使用 final_class_name 以利數據分析)
                     if save_csv: write_to_csv(p.name, final_class_name, confidence_str)
                     if save_txt:  
                         if save_format == 0: coords = ((xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist())
@@ -357,97 +468,150 @@ def run(
                         line = (cls, *coords, conf) if save_conf else (cls, *coords)
                         with open(f"{txt_path}.txt", "a") as f: f.write(("%g " * len(line)).rstrip() % line + "\n")
                     if save_crop: save_one_box(xyxy, imc, file=save_dir / "crops" / final_class_name / f"{p.stem}.jpg", BGR=True)
+
                     # =================================================================
+                    # 🚀 ADAS 深度與「新梯形」範圍判定 (使用 pointPolygonTest 連動)
+                    # =================================================================
+                    # =================================================================
+                    # 💡 駕駛過濾邏輯：區分真實行人與摩托車/腳踏車駕駛
+                    # =================================================================
+                    def calc_iou(boxA, boxB):
+                        """計算兩個框的 IOU（Intersection over Union）"""
+                        xA = max(boxA[0], boxB[0])
+                        yA = max(boxA[1], boxB[1])
+                        xB = min(boxA[2], boxB[2])
+                        yB = min(boxA[3], boxB[3])
+                        interW = max(0, xB - xA)
+                        interH = max(0, yB - yA)
+                        interArea = interW * interH
+                        if interArea == 0:
+                            return 0.0
+                        areaA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+                        areaB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+                        return interArea / float(areaA + areaB - interArea)
 
-                    # 🚀 ADAS 深度與範圍判定 (0 或 1)
+                    def is_rider(person_box, vehicle_box):
+                        """
+                        判斷一個 person 框是否為摩托車/腳踏車的駕駛
+                        條件一：person 框底部在 vehicle 框中線以上（位置判斷）
+                        條件二：IOU 大於 0.2（重疊率判斷）
+                        兩個條件同時成立才判定為駕駛
+                        """
+                        person_bottom = person_box[3]
+                        vehicle_mid_y = (vehicle_box[1] + vehicle_box[3]) / 2
+                        position_ok = person_bottom <= vehicle_mid_y * 1.2  # 加一點緩衝
+                        iou_ok = calc_iou(person_box, vehicle_box) >= 0.2
+                        return position_ok or iou_ok
+
+                    # 先整理這一幀所有偵測到的物件
+                    # det_boxes 格式：{類別名稱: [list of (x1,y1,x2,y2)]}
+                    # 注意：這段要放在 for *xyxy, conf, cls in reversed(det): 迴圈外面
+                    # 所以這裡只處理當前這個目標物
+
+                    # 判斷當前目標是否為騎乘者（person 且跟附近車輛重疊）
+                    if final_class_name == 'person':
+                        is_driver = False
+                        for *v_xyxy, v_conf, v_cls in reversed(det):
+                            v_class = model.names[int(v_cls)]
+                            if v_class in ['motorcycle', 'bicycle']:
+                                v_box = [int(v_xyxy[0]), int(v_xyxy[1]),
+                                         int(v_xyxy[2]), int(v_xyxy[3])]
+                                p_box = [int(xyxy[0]), int(xyxy[1]),
+                                         int(xyxy[2]), int(xyxy[3])]
+                                if is_rider(p_box, v_box):
+                                    is_driver = True
+                                    break
+                        if is_driver:
+                            final_class_name = 'rider'  # 標記為騎乘者，跳過弱勢用路人判定
+
                     vulnerable_road_users = ['person', 'motorcycle', 'bicycle']
-                    # 深度放寬至 0.45，確保遠處物件能觸發判定
-                    if final_class_name in vulnerable_road_users and y_bottom > 0.45:
-                        if (0.35 <= x_center <= 0.65):
-                            danger_detected_now = True
+                    if final_class_name in vulnerable_road_users:
+                        bottom_center_x = int(x_center * w)
+                        bottom_center_y = int(y_bottom * h)
 
-                if danger_detected_now:
-                    danger_hold_frames = 15  # 確實看到危險！補滿 15 幀的警報額度 (大約 0.5 秒)
-                    frame_status = "1"
+                        for (pos, depth), zone_pts in roi_zones.items():
+                            if depth not in active_depths:
+                                continue
+                            if cv2.pointPolygonTest(zone_pts, (bottom_center_x, bottom_center_y), False) >= 0:
+                                if pos == "center" and depth == "near":
+                                    detected_level = 3
+                                elif pos == "center" and depth == "mid" and current_speed >= 51:
+                                    detected_level = 3
+                                elif pos == "left" or pos == "right":
+                                    if depth == "near" and current_speed >= 51:
+                                        detected_level = 3
+                                    elif depth == "near" and current_speed <= 50:
+                                        detected_level = 2
+                                    elif depth == "mid":
+                                        detected_level = 2
+                                    elif depth == "far":
+                                        detected_level = 1
+                                    else:
+                                        detected_level = 1
+                                elif pos == "center" and depth == "mid":
+                                    detected_level = 2
+                                elif pos == "center" and depth == "far":
+                                    detected_level = 2
+                                else:
+                                    detected_level = 1
+                                if detected_level > danger_level_now:
+                                    danger_level_now = detected_level
+                                vru_counter[final_class_name] += 1 
+
+            # 防抖結算：保留最高等級
+            if danger_level_now > 0:
+                danger_hold_frames = 15
+                current_level = danger_level_now
+            else:
+                if danger_hold_frames > 0:
+                    danger_hold_frames -= 1
+                    # current_level 維持上一幀的值，不動（防抖期間保持警示）
                 else:
-                    if danger_hold_frames > 0:
-                        danger_hold_frames -= 1  # 沒看到危險，但還有額度，扣除一幀
-                        frame_status = "1"       # 強制維持警報狀態 1！
-                    else:
-                        frame_status = "0"       # 額度扣光了，確認真的安全，解除警報
+                    current_level = 0
 
-                # =================================================================
-                # 🎨 HUD 級視覺化：半透明陰影區域標註 (全高度縱向鋪滿版)
-                # =================================================================
-                # ===== 新增：ADAS 0/1 傳給 STM32 紅外線發射端 =====
-                print(f"{frame_status}")  # 噴出狀態碼
+            # 依等級決定燈號顏色與 UART 編碼
+            if current_speed == 0:
+                led_color = (0, 255, 0)       # 綠色：靜止
+                uart_code = "AA 00"
+            elif current_level == 0:
+                led_color = (0, 255, 0)       # 綠色：無危險
+                uart_code = "AA 10"
+            elif current_level == 1:
+                led_color = (0, 255, 255)     # 黃色 (BGR)
+                uart_code = "AA 11"
+            elif current_level == 2:
+                led_color = (0, 140, 255)     # 橘色 (BGR)
+                uart_code = "AA 12"
+            else:
+                led_color = (0, 0, 255)       # 紅色 (BGR)
+                uart_code = "AA 13"
 
-                if frame_status == "1":
-                    # 只要出現 1，就立刻進入警示
-                    zero_count = 0
+            # 終端機印出 UART 編碼
+            # 整理 VRU 統計字串
+            vru_summary = " | " + " ".join(
+                f"{v} {k}{'s' if v > 1 else ''}"
+                for k, v in vru_counter.items() if v > 0
+            ) if any(v > 0 for v in vru_counter.values()) else ""
 
-                    if last_sent_state != "1":
-                        ser.write(b"1")
-                        ser.flush()
-                        print("[Nano → STM32] 偵測到風險，已送出：1，啟動紅外線警示")
-                        last_sent_state = "1"
-                    else:
-                        print("[ADAS] 維持警示狀態，不重複送 1")
+            print(f"UART: {uart_code}  |  Level: {current_level}  |  Speed: {current_speed} km/h{vru_summary}")
+          
 
-                else:
-                    # 出現 0 時，不立刻解除，而是累積連續 0 的幀數
-                    zero_count += 1
-                    print(f"[ADAS] 目前為 0，連續 0 幀數：{zero_count}/{ZERO_THRESHOLD}")
+            # HUD 疊合 overlay
+            im0 = annotator.result()
+            cv2.addWeighted(overlay, 0.25, im0, 0.75, 0, im0)
 
-                    if zero_count >= ZERO_THRESHOLD and last_sent_state != "0":
-                        ser.write(b"0")
-                        ser.flush()
-                        print("[Nano → STM32] 連續 3 幀為 0，已送出：0，解除紅外線警示")
-                        last_sent_state = "0"
-                # ===== 新增結束 =====
+            # 畫面左上角：圓形燈號
+            led_center = (40, 40)
+            cv2.circle(im0, led_center, 22, led_color, -1)           # 實心圓
+            cv2.circle(im0, led_center, 22, (255, 255, 255), 2)      # 白色外框
 
-                h, w, _ = im0.shape
-                
-                # 💡 【關鍵修復】：先執行annotator.result()，把畫好的「實體辨識框」沖印沖印上 im0！
-                im0 = annotator.result()
-                
-                # B. 在畫好辨識框的 im0 上方，進行半透明陰影融合，製造 HUD 效果
-                c_x1, c_y1 = int(0.35 * w), 0
-                c_x2, c_y2 = int(0.65 * w), h
-                # C. 核心修復核心修復：這裏要使用從 im0 複製過來的原本 overlay！
-                # 否則陰影下方的 im0 畫布會漏掉 YOLO 的辨識框！
-                cv2.rectangle(overlay, (c_x1, c_y1), (c_x2, c_y2), (0, 0, 255), -1)
-                
-                l_x1, l_y1 = int(0.15 * w), 0
-                l_x2, l_y2 = int(0.35 * w), h
-                cv2.rectangle(overlay, (l_x1, l_y1), (l_x2, l_y2), (0, 120, 255), -1)
-                
-                r_x1, r_y1 = int(0.65 * w), 0
-                r_x2, r_y2 = int(0.85 * w), h
-                cv2.rectangle(overlay, (r_x1, r_y1), (r_x2, r_y2), (0, 120, 255), -1)
-
-                # 關鍵核心：將畫了實心色彩的 overlay 與 已經沖印了辨識框辨識框的 im0 進行淡融合融合
-                # 12% 的極淡透明度 (0.12)，不遮擋夜間視線
-                alpha = 0.88
-                beta = 0.12
-                cv2.addWeighted(overlay, beta, im0, alpha, 0, im0)
-                
-                # 文字提示
-                cv2.putText(im0, f"ADAS: {frame_status}", (c_x1 + 10, int(0.1 * h)), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-                
-                # 📁 畢業製作專屬：實體分類存檔
-                #import os
-                #save_folder = f"ADAS_Output/Status_{frame_status}"
-                #os.makedirs(save_folder, exist_ok=True)
-                #custom_save_path = os.path.join(save_folder, p.name)
-                # 將這張融合了「YOLO辨識框」與「HUD淡陰影」的最終圖片存入分類資料夾
-                #cv2.imwrite(custom_save_path, im0)
-                print(f"目前影格預警狀態 - ADAS: {frame_status}")
- 
+            # 畫面左上角：車速文字（燈號右側）
+            cv2.putText(im0, f"{current_speed} km/h",
+                        (75, 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0,
+                        (255, 255, 255), 2)
 
             # Stream results
-            im0 = annotator.result()
             if view_img:
                 if platform.system() == "Linux" and p not in windows:
                     windows.append(p)
@@ -466,17 +630,17 @@ def run(
                         if isinstance(vid_writer[i], cv2.VideoWriter):
                             vid_writer[i].release()  # release previous video writer
                         if vid_cap:  # video
-                            fps = vid_cap.get(cv2.CAP_PROP_FPS)
+                            _fps_out = vid_cap.get(cv2.CAP_PROP_FPS)  # ← 改這行，用 _fps_out 存輸出用的fps
                             w = int(vid_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
                             h = int(vid_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-                        else:  # stream
-                            fps, w, h = 30, im0.shape[1], im0.shape[0]
-                        save_path = str(Path(save_path).with_suffix(".mp4"))  # force *.mp4 suffix on results videos
-                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+                        else:
+                            _fps_out, w, h = 30, im0.shape[1], im0.shape[0]
+                        save_path = str(Path(save_path).with_suffix(".mp4"))
+                        vid_writer[i] = cv2.VideoWriter(save_path, cv2.VideoWriter_fourcc(*"mp4v"), _fps_out, (w, h))
                     vid_writer[i].write(im0)
 
         # Print time (inference-only)
-        LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
+        #LOGGER.info(f"{s}{'' if len(det) else '(no detections), '}{dt[1].dt * 1e3:.1f}ms")
 
     # Print results
     t = tuple(x.t / seen * 1e3 for x in dt)  # speeds per image
@@ -541,6 +705,7 @@ def parse_opt():
     parser.add_argument("--iou-thres", type=float, default=0.45, help="NMS IoU threshold")
     parser.add_argument("--max-det", type=int, default=1000, help="maximum detections per image")
     parser.add_argument("--device", default="", help="cuda device, i.e. 0 or 0,1,2,3 or cpu")
+    parser.add_argument("--speed", type=str, default="speed_profile.csv", help="車速時序CSV檔案路徑")
     parser.add_argument("--view-img", action="store_true", help="show results")
     parser.add_argument("--save-txt", action="store_true", help="save results to *.txt")
     parser.add_argument(
