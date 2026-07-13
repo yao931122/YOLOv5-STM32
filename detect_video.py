@@ -88,225 +88,7 @@ from utils.general import (
     xyxy2xywh,
 )
 from utils.torch_utils import select_device, smart_inference_mode
-def build_roi_zones(w, h):
-    """
-    根據目前影片解析度建立中央、左側、右側的近／中／遠 ROI。
 
-    注意：
-    這個函式只負責計算 ROI 座標。
-    ROI 顯示仍然會在每一幀重新畫到畫面上。
-    """
-
-    bottom_y = 1.00
-    top_y = 0.52
-
-    # 中央車道
-    center_bottom_l = 0.20
-    center_bottom_r = 0.80
-    center_top_l = 0.45
-    center_top_r = 0.55
-
-    # 左側相鄰車道
-    left_bottom_l = -0.12
-    left_bottom_r = 0.20
-    left_top_l = 0.37
-    left_top_r = 0.45
-
-    # 右側相鄰車道
-    right_bottom_l = 0.80
-    right_bottom_r = 1.12
-    right_top_l = 0.55
-    right_top_r = 0.63
-
-    # 近、中、遠三層
-    layer_y = {
-        "near": (1.00, 0.68),
-        "mid": (0.68, 0.58),
-        "far": (0.58, 0.52),
-    }
-
-    def x_on_edge(bottom_x, top_x, y_ratio):
-        """
-        計算斜線在指定 y 高度時的 x 座標。
-        """
-
-        t = (
-            (bottom_y - y_ratio)
-            / (bottom_y - top_y)
-        )
-
-        return bottom_x + (top_x - bottom_x) * t
-
-    def make_layer_trapezoid(
-        bottom_l,
-        bottom_r,
-        top_l,
-        top_r,
-        y_bottom,
-        y_top,
-    ):
-        """
-        建立一個 ROI 梯形。
-        """
-
-        left_bottom_x = x_on_edge(
-            bottom_l,
-            top_l,
-            y_bottom,
-        )
-
-        left_top_x = x_on_edge(
-            bottom_l,
-            top_l,
-            y_top,
-        )
-
-        right_bottom_x = x_on_edge(
-            bottom_r,
-            top_r,
-            y_bottom,
-        )
-
-        right_top_x = x_on_edge(
-            bottom_r,
-            top_r,
-            y_top,
-        )
-
-        points = np.array(
-            [
-                [
-                    int(left_bottom_x * w),
-                    int(y_bottom * h),
-                ],
-                [
-                    int(left_top_x * w),
-                    int(y_top * h),
-                ],
-                [
-                    int(right_top_x * w),
-                    int(y_top * h),
-                ],
-                [
-                    int(right_bottom_x * w),
-                    int(y_bottom * h),
-                ],
-            ],
-            dtype=np.int32,
-        )
-
-        return points.reshape((-1, 1, 2))
-
-    lane_settings = {
-        "center": (
-            center_bottom_l,
-            center_bottom_r,
-            center_top_l,
-            center_top_r,
-        ),
-        "left": (
-            left_bottom_l,
-            left_bottom_r,
-            left_top_l,
-            left_top_r,
-        ),
-        "right": (
-            right_bottom_l,
-            right_bottom_r,
-            right_top_l,
-            right_top_r,
-        ),
-    }
-
-    roi_zones = {}
-
-    for depth, (y_bottom, y_top) in layer_y.items():
-        for position, lane_values in lane_settings.items():
-            roi_zones[(position, depth)] = (
-                make_layer_trapezoid(
-                    *lane_values,
-                    y_bottom,
-                    y_top,
-                )
-            )
-
-    return roi_zones
-def calc_iou(box_a, box_b):
-    """
-    計算兩個框的 IOU。
-
-    box 格式：
-    [x1, y1, x2, y2]
-    """
-
-    x_a = max(box_a[0], box_b[0])
-    y_a = max(box_a[1], box_b[1])
-    x_b = min(box_a[2], box_b[2])
-    y_b = min(box_a[3], box_b[3])
-
-    intersection_width = max(0.0, x_b - x_a)
-    intersection_height = max(0.0, y_b - y_a)
-
-    intersection_area = (
-        intersection_width
-        * intersection_height
-    )
-
-    if intersection_area <= 0:
-        return 0.0
-
-    area_a = (
-        (box_a[2] - box_a[0])
-        * (box_a[3] - box_a[1])
-    )
-
-    area_b = (
-        (box_b[2] - box_b[0])
-        * (box_b[3] - box_b[1])
-    )
-
-    union_area = (
-        area_a
-        + area_b
-        - intersection_area
-    )
-
-    if union_area <= 0:
-        return 0.0
-
-    return intersection_area / float(union_area)
-
-
-def is_rider(person_box, vehicle_box):
-    """
-    判斷 person 是否可能是 motorcycle／bicycle 的騎乘者。
-
-    目前保持原本程式的判斷邏輯，
-    暫時不改變準確度規則。
-    """
-
-    person_bottom = person_box[3]
-
-    vehicle_mid_y = (
-        vehicle_box[1]
-        + vehicle_box[3]
-    ) / 2.0
-
-    position_ok = (
-        person_bottom
-        <= vehicle_mid_y * 1.2
-    )
-
-    iou_ok = (
-        calc_iou(
-            person_box,
-            vehicle_box,
-        )
-        >= 0.2
-    )
-
-    # 保持原本的 or 邏輯，不在加速階段改判斷規則
-    return position_ok or iou_ok
 
 @smart_inference_mode()
 def run(
@@ -472,10 +254,6 @@ def run(
     else:
         dataset = LoadImages(source, img_size=imgsz, stride=stride, auto=pt, vid_stride=vid_stride)
     vid_path, vid_writer = [None] * bs, [None] * bs
-    # 是否需要產生展示畫面
-    # view_img=True：螢幕顯示
-    # save_img=True：儲存圖片或影片
-    render_output = bool(view_img or save_img)
 
     # Run inference
     model.warmup(imgsz=(1 if pt or model.triton else bs, 3, *imgsz))  # warmup
@@ -485,13 +263,6 @@ def run(
 
     # 記錄上一個已傳送事件，避免每一幀重複傳送
     last_uart_event = None
-    # 記錄上一個輸出的終端狀態
-    last_log_event = None
-
-    # ROI 快取狀態
-    roi_zones = None
-    current_roi_source = None
-    current_roi_size = None
 
     for path, im, im0s, vid_cap, s in dataset:
         with dt[0]:
@@ -541,18 +312,11 @@ def run(
         for i, det in enumerate(pred):  # per image
             seen += 1
             if webcam:  # batch_size >= 1
-                p = path[i]
-                source_im0 = im0s[i]
-                frame = dataset.count
+                p, im0, frame = path[i], im0s[i].copy(), dataset.count
+                s += f"{i}: "
             else:
-                p = path
-                source_im0 = im0s
-                frame = getattr(dataset, "frame", 0)
-            # 只有真的要修改影像時才複製
-            if render_output or save_crop:
-                im0 = source_im0.copy()
-            else:
-                im0 = source_im0
+                p, im0, frame = path, im0s.copy(), getattr(dataset, "frame", 0)
+
             p = Path(p)  # to Path
             save_path = str(save_dir / p.name)  # im.jpg
             txt_path = str(save_dir / "labels" / p.stem) + ("" if dataset.mode == "image" else f"_{frame}")  # im.txt
@@ -562,38 +326,12 @@ def run(
             annotator = Annotator(im0, line_width=line_thickness)
 
             # Write results
+            danger_detected_now = False 
             danger_level_now = 0
             vru_counter = {"person": 0, "motorcycle": 0, "bicycle": 0}
             
             h, w, _ = im0.shape
-            # =========================================================
-            # ROI 座標只在：
-            # 1. 第一幀
-            # 2. 換影片
-            # 3. 解析度改變
-            # 時重新建立
-            # =========================================================
-            source_key = str(p)
-            size_key = (w, h)
 
-            if (
-                roi_zones is None
-                or source_key != current_roi_source
-                or size_key != current_roi_size
-            ):
-                roi_zones = build_roi_zones(
-                    w,
-                    h,
-                )
-
-                current_roi_source = source_key
-                current_roi_size = size_key
-
-                print(
-                    f"ROI 已建立："
-                    f"source={source_key}, "
-                    f"resolution={w}x{h}"
-                )
             current_time_sec = int(frame / fps)  # 30 FPS，幀數除以 FPS 取得秒數
             current_speed = speed_profile.get(current_time_sec, 0)  # 查表，找不到預設 0
  
@@ -607,6 +345,78 @@ def run(
             else:
                 active_depths = ["near", "mid", "far"]    # 高速：全開
 
+            # =================================================================
+            # 💡 新邏輯：先定義一個「大梯形」的左右邊界斜線方程式，
+            # 再用水平線在不同高度切出近/中/遠三層，確保所有層級的
+            # 左右邊界都精確落在同一條斜線上，不會有轉折/上翹的問題
+            # =================================================================
+
+            # 大梯形的四個關鍵控制點（最寬的底部 與 最窄的頂部）
+            BOTTOM_Y = 1.00   # 畫面最底部
+            TOP_Y    = 0.52   # 整個ROI系統的最頂端（消失點附近）→ 比上次收回一點，避免拉太遠上翹
+
+            # 中央車道：底部寬、頂部窄 → 再放寬一點
+            CENTER_BOTTOM_L, CENTER_BOTTOM_R = 0.20, 0.80
+            CENTER_TOP_L,    CENTER_TOP_R    = 0.45, 0.55
+
+            # 左側相鄰車道：底部寬、頂部窄（接在中央車道左邊）
+            LEFT_BOTTOM_L, LEFT_BOTTOM_R = -0.12, 0.20
+            LEFT_TOP_L,    LEFT_TOP_R    = 0.37, 0.45
+
+            # 右側相鄰車道：底部寬、頂部窄（接在中央車道右邊）
+            RIGHT_BOTTOM_L, RIGHT_BOTTOM_R = 0.80, 1.12
+            RIGHT_TOP_L,    RIGHT_TOP_R    = 0.55, 0.63
+
+            # 三層的水平切割線（高度比例），數字越小越接近消失點
+            # 近端再拉長（1.00→0.68，原本只到0.75）
+            LAYER_Y = {
+                "near": (1.00, 0.68),   # 近端：底部 -> 0.68h（再拉長）
+                "mid":  (0.68, 0.58),   # 中端：0.68h -> 0.58h
+                "far":  (0.58, 0.52),   # 遠端：0.58h -> 0.52h
+            }
+
+            def lerp(a, b, t):
+                """線性插值：在 a 到 b 之間，依比例 t 取值"""
+                return a + (b - a) * t
+
+            def x_on_edge(bottom_x, top_x, y_ratio):
+                """
+                給定一條從(bottom_x, BOTTOM_Y)到(top_x, TOP_Y)的斜線，
+                求這條線在某個 y_ratio 高度時的 x 座標
+                """
+                t = (BOTTOM_Y - y_ratio) / (BOTTOM_Y - TOP_Y)
+                return lerp(bottom_x, top_x, t)
+
+            def make_layer_trapezoid(bottom_l, bottom_r, top_l, top_r, y_bottom, y_top):
+                """
+                依「左右兩條邊界斜線」與「指定的上下高度」，算出該層梯形的四個頂點。
+                這樣同一個方向(中/左/右)的三層，左右邊界永遠落在同一條斜線上。
+                """
+                left_bottom_x  = x_on_edge(bottom_l, top_l, y_bottom)
+                left_top_x     = x_on_edge(bottom_l, top_l, y_top)
+                right_bottom_x = x_on_edge(bottom_r, top_r, y_bottom)
+                right_top_x    = x_on_edge(bottom_r, top_r, y_top)
+
+                pts = np.array([
+                    [int(left_bottom_x * w),  int(y_bottom * h)],  # 左下
+                    [int(left_top_x * w),     int(y_top * h)],     # 左上
+                    [int(right_top_x * w),    int(y_top * h)],     # 右上
+                    [int(right_bottom_x * w), int(y_bottom * h)],  # 右下
+                ], np.int32)
+                return pts.reshape((-1, 1, 2))
+
+            # ---- 依三層高度，分別產生中央/左側/右側的梯形 ----
+            roi_zones = {}
+            for depth, (y_b, y_t) in LAYER_Y.items():
+                roi_zones[("center", depth)] = make_layer_trapezoid(
+                    CENTER_BOTTOM_L, CENTER_BOTTOM_R, CENTER_TOP_L, CENTER_TOP_R, y_b, y_t
+                )
+                roi_zones[("left", depth)] = make_layer_trapezoid(
+                    LEFT_BOTTOM_L, LEFT_BOTTOM_R, LEFT_TOP_L, LEFT_TOP_R, y_b, y_t
+                )
+                roi_zones[("right", depth)] = make_layer_trapezoid(
+                    RIGHT_BOTTOM_L, RIGHT_BOTTOM_R, RIGHT_TOP_L, RIGHT_TOP_R, y_b, y_t
+                )
 
             # 🎨 先複製一份乾淨的 im0 用來製作科技感陰影
             overlay = im0.copy()
@@ -697,7 +507,33 @@ def run(
                     # =================================================================
                     # 💡 駕駛過濾邏輯：區分真實行人與摩托車/腳踏車駕駛
                     # =================================================================
-                    
+                    def calc_iou(boxA, boxB):
+                        """計算兩個框的 IOU（Intersection over Union）"""
+                        xA = max(boxA[0], boxB[0])
+                        yA = max(boxA[1], boxB[1])
+                        xB = min(boxA[2], boxB[2])
+                        yB = min(boxA[3], boxB[3])
+                        interW = max(0, xB - xA)
+                        interH = max(0, yB - yA)
+                        interArea = interW * interH
+                        if interArea == 0:
+                            return 0.0
+                        areaA = (boxA[2]-boxA[0]) * (boxA[3]-boxA[1])
+                        areaB = (boxB[2]-boxB[0]) * (boxB[3]-boxB[1])
+                        return interArea / float(areaA + areaB - interArea)
+
+                    def is_rider(person_box, vehicle_box):
+                        """
+                        判斷一個 person 框是否為摩托車/腳踏車的駕駛
+                        條件一：person 框底部在 vehicle 框中線以上（位置判斷）
+                        條件二：IOU 大於 0.2（重疊率判斷）
+                        兩個條件同時成立才判定為駕駛
+                        """
+                        person_bottom = person_box[3]
+                        vehicle_mid_y = (vehicle_box[1] + vehicle_box[3]) / 2
+                        position_ok = person_bottom <= vehicle_mid_y * 1.2  # 加一點緩衝
+                        iou_ok = calc_iou(person_box, vehicle_box) >= 0.2
+                        return position_ok or iou_ok
 
                     # 先整理這一幀所有偵測到的物件
                     # det_boxes 格式：{類別名稱: [list of (x1,y1,x2,y2)]}
